@@ -1,16 +1,24 @@
 extends Node2D
 
-const BUILD_NUMBER := 5
+const BUILD_NUMBER := 6
 
 # ---- Tunable gameplay values (seconds) ----
 const PLANT_TIME := 1.0
 const HARVEST_TIME := 1.0
 const COLLECT_TIME := 1.0
+const DELIVER_TIME := 1.0
 const CROP_GROW_TIME := 8.0
 const EGG_TIME := 12.0
 const EGG_CAP := 4
+const MAIN_TIME := 90.0
+const GRACE_TIME := 15.0
 const FARMER_SPEED := 280.0
 const DRAG_THRESHOLD := 14.0
+
+# ---- Order waves (one entry per wave) ----
+const WAVE_TOMATOES: Array[int] = [2, 3, 3]
+const WAVE_EGGS: Array[int] = [1, 2, 2]
+const WAVE_REWARD: Array[int] = [20, 40, 60]
 
 # ---- Map ----
 const GRID_W := 14
@@ -32,6 +40,10 @@ const START_CELL := Vector2i(7, 7)
 const PLOT_EMPTY := 0
 const PLOT_GROWING := 1
 const PLOT_READY := 2
+
+const STATE_PLAYING := 0
+const STATE_WON := 1
+const STATE_LOST := 2
 
 class Plot:
     var cell: Vector2i = Vector2i.ZERO
@@ -63,14 +75,30 @@ var _tomatoes := 0
 var _eggs := 0
 var _eggs_ready := 0
 var _egg_timer := 0.0
+var _money := 0
+
+var _wave := 0
+var _del_tomatoes := 0
+var _del_eggs := 0
+var _time_left := MAIN_TIME
+var _in_grace := false
+var _game_state := STATE_PLAYING
 var _paused := false
 
 var _flash_cell := Vector2i.ZERO
 var _flash_left := 0.0
+var _toast_left := 0.0
 
 var _toast_label: Label
-var _toast_left := 0.0
 var _inv_label: Label
+var _timer_label: Label
+var _order_label: Label
+var _pause_btn: Button
+var _overlay: Control
+var _ov_title: Label
+var _ov_info: Label
+var _resume_btn: Button
+var _restart_btn: Button
 
 var _press_active := false
 var _press_pos := Vector2.ZERO
@@ -107,6 +135,7 @@ func _ready() -> void:
     _build_hud()
     _clamp_camera()
     queue_redraw()
+    _toast("Order 1 is in! Grow tomatoes, collect eggs, deliver.")
 
 
 func _build_map_data() -> void:
@@ -130,6 +159,8 @@ func _build_map_data() -> void:
         _astar.set_point_solid(blocked_cell, true)
 
 
+# ---------------- HUD ----------------
+
 func _make_label(font_size: int) -> Label:
     var l := Label.new()
     l.add_theme_font_size_override("font_size", font_size)
@@ -139,21 +170,41 @@ func _make_label(font_size: int) -> Label:
     return l
 
 
+func _make_button(text: String, w: float) -> Button:
+    var b := Button.new()
+    b.text = text
+    b.custom_minimum_size = Vector2(w, 64)
+    b.add_theme_font_size_override("font_size", 30)
+    return b
+
+
 func _build_hud() -> void:
     var hud := CanvasLayer.new()
     add_child(hud)
 
-    var title := _make_label(24)
-    title.text = "Sunpatch Farm - Build %d\nTap to move or work - drag to scroll" % BUILD_NUMBER
+    var title := _make_label(20)
+    title.text = "Sunpatch Farm - Build %d\nTap to move or work\nDrag to scroll" % BUILD_NUMBER
     hud.add_child(title)
     title.position = Vector2(16, 12)
 
-    _inv_label = _make_label(30)
+    _inv_label = _make_label(28)
     _inv_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
     hud.add_child(_inv_label)
     _inv_label.set_anchors_preset(Control.PRESET_TOP_WIDE)
     _inv_label.offset_top = 12.0
     _inv_label.offset_right = -16.0
+
+    _timer_label = _make_label(52)
+    _timer_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+    hud.add_child(_timer_label)
+    _timer_label.set_anchors_preset(Control.PRESET_TOP_WIDE)
+    _timer_label.offset_top = 4.0
+
+    _order_label = _make_label(26)
+    _order_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+    hud.add_child(_order_label)
+    _order_label.set_anchors_preset(Control.PRESET_TOP_WIDE)
+    _order_label.offset_top = 66.0
 
     _toast_label = _make_label(30)
     _toast_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -164,17 +215,101 @@ func _build_hud() -> void:
     _toast_label.offset_bottom = -20.0
     _toast_label.modulate.a = 0.0
 
+    _pause_btn = _make_button("Pause", 140.0)
+    hud.add_child(_pause_btn)
+    _pause_btn.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
+    _pause_btn.offset_left = 16.0
+    _pause_btn.offset_top = -80.0
+    _pause_btn.offset_right = 156.0
+    _pause_btn.offset_bottom = -16.0
+    _pause_btn.pressed.connect(_on_pause_pressed)
+
+    _build_overlay(hud)
     _update_hud()
 
 
+func _build_overlay(hud: CanvasLayer) -> void:
+    _overlay = Control.new()
+    hud.add_child(_overlay)
+    _overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+    _overlay.visible = false
+
+    var dim := ColorRect.new()
+    dim.color = Color(0, 0, 0, 0.72)
+    _overlay.add_child(dim)
+    dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+
+    var center := CenterContainer.new()
+    _overlay.add_child(center)
+    center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+
+    var box := VBoxContainer.new()
+    box.add_theme_constant_override("separation", 20)
+    center.add_child(box)
+
+    _ov_title = _make_label(72)
+    _ov_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+    box.add_child(_ov_title)
+
+    _ov_info = _make_label(30)
+    _ov_info.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+    box.add_child(_ov_info)
+
+    _resume_btn = _make_button("Resume", 320.0)
+    _resume_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+    _resume_btn.pressed.connect(_on_resume_pressed)
+    box.add_child(_resume_btn)
+
+    _restart_btn = _make_button("Restart", 320.0)
+    _restart_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+    _restart_btn.pressed.connect(_on_restart_pressed)
+    box.add_child(_restart_btn)
+
+
+func _show_overlay(title: String, info: String, can_resume: bool, restart_text: String) -> void:
+    _ov_title.text = title
+    _ov_info.text = info
+    _resume_btn.visible = can_resume
+    _restart_btn.text = restart_text
+    _overlay.visible = true
+    _pause_btn.visible = false
+
+
+func _on_pause_pressed() -> void:
+    if _game_state != STATE_PLAYING or _paused:
+        return
+    _paused = true
+    _show_overlay("PAUSED", "The game clock is stopped.", true, "Restart")
+
+
+func _on_resume_pressed() -> void:
+    _paused = false
+    _overlay.visible = false
+    _pause_btn.visible = true
+
+
+func _on_restart_pressed() -> void:
+    get_tree().reload_current_scene()
+
+
 func _update_hud() -> void:
-    _inv_label.text = "Tomatoes: %d     Eggs: %d" % [_tomatoes, _eggs]
+    _inv_label.text = "Tomatoes: %d     Eggs: %d\nMoney: $%d" % [_tomatoes, _eggs, _money]
+    if _in_grace:
+        _timer_label.text = "GRACE  %d" % ceili(_time_left)
+    else:
+        _timer_label.text = "%d" % ceili(_time_left)
+    var w := mini(_wave, WAVE_TOMATOES.size() - 1)
+    _order_label.text = "Order %d of %d\nTomatoes %d/%d    Eggs %d/%d    Reward $%d" % [
+        w + 1, WAVE_TOMATOES.size(),
+        _del_tomatoes, WAVE_TOMATOES[w],
+        _del_eggs, WAVE_EGGS[w],
+        WAVE_REWARD[w]]
 
 
 func _toast(text: String) -> void:
     _toast_label.text = text
     _toast_label.modulate.a = 1.0
-    _toast_left = 2.0
+    _toast_left = 2.5
 
 
 func _flash(cell: Vector2i) -> void:
@@ -190,13 +325,25 @@ func _process(delta: float) -> void:
     if _toast_left > 0.0:
         _toast_left -= delta
         _toast_label.modulate.a = clampf(_toast_left / 0.5, 0.0, 1.0)
-    if not _paused:
+    if not _paused and _game_state == STATE_PLAYING:
         _tick_world(delta)
     _update_hud()
     _entities.queue_redraw()
 
 
 func _tick_world(delta: float) -> void:
+    _time_left -= delta
+    if _time_left <= 0.0:
+        if not _in_grace:
+            _in_grace = true
+            _time_left = GRACE_TIME
+            _timer_label.add_theme_color_override("font_color", Color(1.0, 0.3, 0.3))
+            _toast("Time's up! Grace period - finish your orders!")
+        else:
+            _time_left = 0.0
+            _end_game(false)
+            return
+
     for p in _plots:
         if p.state == PLOT_GROWING:
             p.grow_left -= delta
@@ -249,8 +396,18 @@ func _arrive() -> void:
                 _toast("No eggs yet")
                 _after_action()
         "delivery":
-            _toast("Orders start arriving in the next build")
-            _after_action()
+            var give := _deliverable()
+            if give.x + give.y > 0:
+                _start_action("deliver", DELIVER_TIME, null)
+            else:
+                _toast("Nothing in your basket for this order")
+                _after_action()
+
+
+func _deliverable() -> Vector2i:
+    return Vector2i(
+        mini(_tomatoes, WAVE_TOMATOES[_wave] - _del_tomatoes),
+        mini(_eggs, WAVE_EGGS[_wave] - _del_eggs))
 
 
 func _begin_plot_action(p: Plot) -> void:
@@ -296,10 +453,47 @@ func _finish_action() -> void:
             _eggs += _eggs_ready
             _toast("+%d Eggs" % _eggs_ready)
             _eggs_ready = 0
+        "deliver":
+            var give := _deliverable()
+            _tomatoes -= give.x
+            _eggs -= give.y
+            _del_tomatoes += give.x
+            _del_eggs += give.y
+            if _del_tomatoes >= WAVE_TOMATOES[_wave] and _del_eggs >= WAVE_EGGS[_wave]:
+                _complete_wave()
+            else:
+                _toast("Delivered %d tomatoes, %d eggs" % [give.x, give.y])
     _after_action()
 
 
+func _complete_wave() -> void:
+    var reward := WAVE_REWARD[_wave]
+    _money += reward
+    _wave += 1
+    _del_tomatoes = 0
+    _del_eggs = 0
+    if _wave >= WAVE_TOMATOES.size():
+        _end_game(true)
+    else:
+        _toast("Order complete! +$%d - next customer is here" % reward)
+
+
+func _end_game(won: bool) -> void:
+    if won:
+        _game_state = STATE_WON
+        _show_overlay("YOU WIN!",
+            "All %d orders delivered!\nMoney earned: $%d\nTime left: %d s" % [WAVE_TOMATOES.size(), _money, ceili(_time_left)],
+            false, "Play again")
+    else:
+        _game_state = STATE_LOST
+        _show_overlay("TIME'S UP",
+            "Orders completed: %d of %d\nMoney earned: $%d" % [_wave, WAVE_TOMATOES.size(), _money],
+            false, "Try again")
+
+
 func _after_action() -> void:
+    if _game_state != STATE_PLAYING:
+        return
     if _queued != null:
         var q := _queued
         _queued = null
@@ -371,6 +565,8 @@ func _cell_at_world(w: Vector2) -> Vector2i:
 
 
 func _handle_tap(screen_pos: Vector2) -> void:
+    if _paused or _game_state != STATE_PLAYING:
+        return
     var world: Vector2 = get_viewport().get_canvas_transform().affine_inverse() * screen_pos
     var cell := _cell_at_world(world)
     if not _in_grid(cell):
@@ -397,6 +593,8 @@ func _handle_tap(screen_pos: Vector2) -> void:
 # ---------------- Input ----------------
 
 func _unhandled_input(event: InputEvent) -> void:
+    if _paused or _game_state != STATE_PLAYING:
+        return
     if event is InputEventMouseButton:
         var mb := event as InputEventMouseButton
         if mb.button_index != MOUSE_BUTTON_LEFT:
