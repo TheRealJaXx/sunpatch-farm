@@ -1,6 +1,18 @@
 extends Node2D
 
-const BUILD_NUMBER := 4
+const BUILD_NUMBER := 5
+
+# ---- Tunable gameplay values (seconds) ----
+const PLANT_TIME := 1.0
+const HARVEST_TIME := 1.0
+const COLLECT_TIME := 1.0
+const CROP_GROW_TIME := 8.0
+const EGG_TIME := 12.0
+const EGG_CAP := 4
+const FARMER_SPEED := 280.0
+const DRAG_THRESHOLD := 14.0
+
+# ---- Map ----
 const GRID_W := 14
 const GRID_H := 14
 const TILE_W := 128.0
@@ -10,50 +22,402 @@ const COLOR_B := Color(0.40, 0.69, 0.32)
 const COLOR_EDGE := Color(0.25, 0.50, 0.22)
 const MAP_BOUNDS := Rect2(-896.0, -32.0, 1792.0, 896.0)
 
+const DIRS: Array[Vector2i] = [Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1)]
+const TREE_CELLS: Array[Vector2i] = [Vector2i(1, 1), Vector2i(2, 12), Vector2i(12, 6), Vector2i(8, 11), Vector2i(6, 2)]
+const PLOT_CELLS: Array[Vector2i] = [Vector2i(4, 5), Vector2i(4, 7), Vector2i(4, 9)]
+const COOP_CELL := Vector2i(10, 3)
+const DELIVERY_CELL := Vector2i(11, 10)
+const START_CELL := Vector2i(7, 7)
+
+const PLOT_EMPTY := 0
+const PLOT_GROWING := 1
+const PLOT_READY := 2
+
+class Plot:
+    var cell: Vector2i = Vector2i.ZERO
+    var state: int = 0
+    var grow_left: float = 0.0
+
+class Order:
+    var kind: String = "move"
+    var plot: Plot = null
+    var cell: Vector2i = Vector2i.ZERO
+
 var _camera: Camera2D
+var _entities: Node2D
+var _astar: AStarGrid2D
+var _plots: Array[Plot] = []
+var _blocked: Array[Vector2i] = []
+
+var _pos := Vector2.ZERO
+var _path: Array[Vector2i] = []
+var _order: Order = null
+var _queued: Order = null
+
+var _act_kind := ""
+var _act_left := 0.0
+var _act_total := 1.0
+var _act_plot: Plot = null
+
+var _tomatoes := 0
+var _eggs := 0
+var _eggs_ready := 0
+var _egg_timer := 0.0
+var _paused := false
+
+var _flash_cell := Vector2i.ZERO
+var _flash_left := 0.0
+
+var _toast_label: Label
+var _toast_left := 0.0
+var _inv_label: Label
+
+var _press_active := false
+var _press_pos := Vector2.ZERO
+var _dragging := false
+
 
 func grid_to_world(cell: Vector2i) -> Vector2:
     return Vector2((cell.x - cell.y) * TILE_W * 0.5, (cell.x + cell.y) * TILE_H * 0.5)
 
+
+func _world_to_cell(w: Vector2) -> Vector2i:
+    var u := (w.x / (TILE_W * 0.5) + w.y / (TILE_H * 0.5)) * 0.5
+    var v := (w.y / (TILE_H * 0.5) - w.x / (TILE_W * 0.5)) * 0.5
+    return Vector2i(roundi(u), roundi(v))
+
+
+func _in_grid(c: Vector2i) -> bool:
+    return c.x >= 0 and c.y >= 0 and c.x < GRID_W and c.y < GRID_H
+
+
 func _ready() -> void:
+    _build_map_data()
+    _pos = grid_to_world(START_CELL)
+
+    _entities = Node2D.new()
+    add_child(_entities)
+    _entities.draw.connect(_draw_entities)
+
     _camera = Camera2D.new()
     _camera.position = MAP_BOUNDS.get_center()
     add_child(_camera)
     _camera.make_current()
 
-    var hud := CanvasLayer.new()
-    add_child(hud)
-    var label := Label.new()
-    label.text = "Sunpatch Farm - Build %d - drag to scroll" % BUILD_NUMBER
-    label.position = Vector2(16, 12)
-    label.add_theme_font_size_override("font_size", 28)
-    label.add_theme_color_override("font_outline_color", Color.BLACK)
-    label.add_theme_constant_override("outline_size", 6)
-    label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-    hud.add_child(label)
-
+    _build_hud()
     _clamp_camera()
     queue_redraw()
 
-func _draw() -> void:
-    for y in GRID_H:
-        for x in GRID_W:
-            var c := grid_to_world(Vector2i(x, y))
-            var pts := PackedVector2Array([
-                c + Vector2(0, -TILE_H * 0.5),
-                c + Vector2(TILE_W * 0.5, 0),
-                c + Vector2(0, TILE_H * 0.5),
-                c + Vector2(-TILE_W * 0.5, 0),
-            ])
-            draw_colored_polygon(pts, COLOR_A if (x + y) % 2 == 0 else COLOR_B)
-            var outline := pts.duplicate()
-            outline.append(pts[0])
-            draw_polyline(outline, COLOR_EDGE, 1.5)
 
-func _input(event: InputEvent) -> void:
-    if event is InputEventMouseMotion and (event.button_mask & MOUSE_BUTTON_MASK_LEFT) != 0:
-        _camera.position -= event.relative / _camera.zoom
-        _clamp_camera()
+func _build_map_data() -> void:
+    _blocked.clear()
+    for tree_cell in TREE_CELLS:
+        _blocked.append(tree_cell)
+    for plot_cell in PLOT_CELLS:
+        var p := Plot.new()
+        p.cell = plot_cell
+        _plots.append(p)
+        _blocked.append(plot_cell)
+    _blocked.append(COOP_CELL)
+    _blocked.append(DELIVERY_CELL)
+
+    _astar = AStarGrid2D.new()
+    _astar.region = Rect2i(0, 0, GRID_W, GRID_H)
+    _astar.cell_size = Vector2(1, 1)
+    _astar.diagonal_mode = AStarGrid2D.DIAGONAL_MODE_NEVER
+    _astar.update()
+    for blocked_cell in _blocked:
+        _astar.set_point_solid(blocked_cell, true)
+
+
+func _make_label(font_size: int) -> Label:
+    var l := Label.new()
+    l.add_theme_font_size_override("font_size", font_size)
+    l.add_theme_color_override("font_outline_color", Color.BLACK)
+    l.add_theme_constant_override("outline_size", 6)
+    l.mouse_filter = Control.MOUSE_FILTER_IGNORE
+    return l
+
+
+func _build_hud() -> void:
+    var hud := CanvasLayer.new()
+    add_child(hud)
+
+    var title := _make_label(24)
+    title.text = "Sunpatch Farm - Build %d\nTap to move or work - drag to scroll" % BUILD_NUMBER
+    hud.add_child(title)
+    title.position = Vector2(16, 12)
+
+    _inv_label = _make_label(30)
+    _inv_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+    hud.add_child(_inv_label)
+    _inv_label.set_anchors_preset(Control.PRESET_TOP_WIDE)
+    _inv_label.offset_top = 12.0
+    _inv_label.offset_right = -16.0
+
+    _toast_label = _make_label(30)
+    _toast_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+    _toast_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+    hud.add_child(_toast_label)
+    _toast_label.set_anchors_preset(Control.PRESET_BOTTOM_WIDE)
+    _toast_label.offset_top = -80.0
+    _toast_label.offset_bottom = -20.0
+    _toast_label.modulate.a = 0.0
+
+    _update_hud()
+
+
+func _update_hud() -> void:
+    _inv_label.text = "Tomatoes: %d     Eggs: %d" % [_tomatoes, _eggs]
+
+
+func _toast(text: String) -> void:
+    _toast_label.text = text
+    _toast_label.modulate.a = 1.0
+    _toast_left = 2.0
+
+
+func _flash(cell: Vector2i) -> void:
+    _flash_cell = cell
+    _flash_left = 0.6
+
+
+# ---------------- Game loop ----------------
+
+func _process(delta: float) -> void:
+    if _flash_left > 0.0:
+        _flash_left -= delta
+    if _toast_left > 0.0:
+        _toast_left -= delta
+        _toast_label.modulate.a = clampf(_toast_left / 0.5, 0.0, 1.0)
+    if not _paused:
+        _tick_world(delta)
+    _update_hud()
+    _entities.queue_redraw()
+
+
+func _tick_world(delta: float) -> void:
+    for p in _plots:
+        if p.state == PLOT_GROWING:
+            p.grow_left -= delta
+            if p.grow_left <= 0.0:
+                p.grow_left = 0.0
+                p.state = PLOT_READY
+
+    if _eggs_ready < EGG_CAP:
+        _egg_timer += delta
+        if _egg_timer >= EGG_TIME:
+            _egg_timer = 0.0
+            _eggs_ready += 1
+
+    if _act_kind != "":
+        _act_left -= delta
+        if _act_left <= 0.0:
+            _finish_action()
+        return
+
+    _move_farmer(delta)
+
+
+func _move_farmer(delta: float) -> void:
+    if _path.is_empty():
+        return
+    var target := grid_to_world(_path[0])
+    var step := FARMER_SPEED * delta
+    if _pos.distance_to(target) <= step:
+        _pos = target
+        _path.remove_at(0)
+        if _path.is_empty():
+            _arrive()
+    else:
+        _pos += (target - _pos).normalized() * step
+
+
+func _arrive() -> void:
+    var o := _order
+    _order = null
+    if o == null or o.kind == "move":
+        _after_action()
+        return
+    match o.kind:
+        "plot":
+            _begin_plot_action(o.plot)
+        "coop":
+            if _eggs_ready > 0:
+                _start_action("collect", COLLECT_TIME, null)
+            else:
+                _toast("No eggs yet")
+                _after_action()
+        "delivery":
+            _toast("Orders start arriving in the next build")
+            _after_action()
+
+
+func _begin_plot_action(p: Plot) -> void:
+    if p.state == PLOT_EMPTY:
+        _start_action("plant", PLANT_TIME, p)
+    elif p.state == PLOT_READY:
+        _start_action("harvest", HARVEST_TIME, p)
+    else:
+        _toast("Still growing...")
+        _after_action()
+
+
+func _start_action(kind: String, duration: float, p: Plot) -> void:
+    _act_kind = kind
+    _act_left = duration
+    _act_total = duration
+    _act_plot = p
+
+
+func _cancel_action() -> void:
+    _act_kind = ""
+    _act_left = 0.0
+    _act_plot = null
+    _path.clear()
+    _order = null
+
+
+func _finish_action() -> void:
+    var kind := _act_kind
+    var p := _act_plot
+    _act_kind = ""
+    _act_left = 0.0
+    _act_plot = null
+    match kind:
+        "plant":
+            p.state = PLOT_GROWING
+            p.grow_left = CROP_GROW_TIME
+        "harvest":
+            p.state = PLOT_EMPTY
+            _tomatoes += 1
+            _toast("+1 Tomato")
+        "collect":
+            _eggs += _eggs_ready
+            _toast("+%d Eggs" % _eggs_ready)
+            _eggs_ready = 0
+    _after_action()
+
+
+func _after_action() -> void:
+    if _queued != null:
+        var q := _queued
+        _queued = null
+        _start_order(q)
+
+
+# ---------------- Orders and pathfinding ----------------
+
+func _order_for_cell(cell: Vector2i) -> Order:
+    var o := Order.new()
+    o.cell = cell
+    if cell == COOP_CELL:
+        o.kind = "coop"
+        return o
+    if cell == DELIVERY_CELL:
+        o.kind = "delivery"
+        return o
+    for p in _plots:
+        if p.cell == cell:
+            o.kind = "plot"
+            o.plot = p
+            return o
+    if _blocked.has(cell):
+        return null
+    return o
+
+
+func _same_order(a: Order, b: Order) -> bool:
+    return a.kind == b.kind and a.cell == b.cell
+
+
+func _path_to_adjacent(target: Vector2i) -> Array[Vector2i]:
+    var best: Array[Vector2i] = []
+    var start := _world_to_cell(_pos)
+    for d in DIRS:
+        var n: Vector2i = target + d
+        if not _in_grid(n) or _astar.is_point_solid(n):
+            continue
+        var p: Array[Vector2i] = _astar.get_id_path(start, n)
+        if p.is_empty():
+            continue
+        if best.is_empty() or p.size() < best.size():
+            best = p
+    return best
+
+
+func _start_order(order: Order) -> void:
+    var path: Array[Vector2i] = []
+    if order.kind == "move":
+        path = _astar.get_id_path(_world_to_cell(_pos), order.cell)
+    else:
+        path = _path_to_adjacent(order.cell)
+    if path.is_empty():
+        _flash(order.cell)
+        _toast("Can't reach that spot")
+        return
+    _order = order
+    _path = path
+
+
+func _cell_at_world(w: Vector2) -> Vector2i:
+    var cc := grid_to_world(COOP_CELL)
+    if Rect2(cc.x - 46.0, cc.y - 90.0, 92.0, 104.0).has_point(w):
+        return COOP_CELL
+    var dc := grid_to_world(DELIVERY_CELL)
+    if Rect2(dc.x - 34.0, dc.y - 60.0, 68.0, 80.0).has_point(w):
+        return DELIVERY_CELL
+    return _world_to_cell(w)
+
+
+func _handle_tap(screen_pos: Vector2) -> void:
+    var world: Vector2 = get_viewport().get_canvas_transform().affine_inverse() * screen_pos
+    var cell := _cell_at_world(world)
+    if not _in_grid(cell):
+        return
+    var order := _order_for_cell(cell)
+    if order == null:
+        _flash(cell)
+        _toast("Blocked")
+        return
+
+    if _act_kind != "":
+        # Busy working: first tap queues, a different tap after that interrupts.
+        if _queued != null and not _same_order(_queued, order):
+            _cancel_action()
+            _queued = null
+            _start_order(order)
+        else:
+            _queued = order
+            _toast("Queued next job (tap elsewhere to interrupt)")
+    else:
+        _start_order(order)
+
+
+# ---------------- Input ----------------
+
+func _unhandled_input(event: InputEvent) -> void:
+    if event is InputEventMouseButton:
+        var mb := event as InputEventMouseButton
+        if mb.button_index != MOUSE_BUTTON_LEFT:
+            return
+        if mb.pressed:
+            _press_active = true
+            _press_pos = mb.position
+            _dragging = false
+        else:
+            if _press_active and not _dragging:
+                _handle_tap(mb.position)
+            _press_active = false
+            _dragging = false
+    elif event is InputEventMouseMotion and _press_active:
+        var mm := event as InputEventMouseMotion
+        if not _dragging and mm.position.distance_to(_press_pos) > DRAG_THRESHOLD:
+            _dragging = true
+        if _dragging:
+            _camera.position -= mm.relative / _camera.zoom
+            _clamp_camera()
+
 
 func _clamp_camera() -> void:
     var half := get_viewport_rect().size * 0.5 / _camera.zoom
@@ -62,3 +426,106 @@ func _clamp_camera() -> void:
     var c := MAP_BOUNDS.get_center()
     _camera.position.x = c.x if min_p.x > max_p.x else clampf(_camera.position.x, min_p.x, max_p.x)
     _camera.position.y = c.y if min_p.y > max_p.y else clampf(_camera.position.y, min_p.y, max_p.y)
+
+
+# ---------------- Drawing ----------------
+
+func _diamond_points(c: Vector2, s: float) -> PackedVector2Array:
+    return PackedVector2Array([
+        c + Vector2(0, -TILE_H * 0.5 * s),
+        c + Vector2(TILE_W * 0.5 * s, 0),
+        c + Vector2(0, TILE_H * 0.5 * s),
+        c + Vector2(-TILE_W * 0.5 * s, 0),
+    ])
+
+
+func _draw() -> void:
+    for y in GRID_H:
+        for x in GRID_W:
+            var c := grid_to_world(Vector2i(x, y))
+            var pts := _diamond_points(c, 1.0)
+            draw_colored_polygon(pts, COLOR_A if (x + y) % 2 == 0 else COLOR_B)
+            pts.append(pts[0])
+            draw_polyline(pts, COLOR_EDGE, 1.5)
+
+
+func _diamond_outline(cell: Vector2i, color: Color) -> void:
+    var pts := _diamond_points(grid_to_world(cell), 0.9)
+    pts.append(pts[0])
+    _entities.draw_polyline(pts, color, 4.0)
+
+
+func _draw_entities() -> void:
+    if _order != null and _order.kind == "move":
+        _diamond_outline(_order.cell, Color(1, 1, 1, 0.9))
+    if _queued != null:
+        _diamond_outline(_queued.cell, Color(1.0, 0.65, 0.1, 0.95))
+    if _flash_left > 0.0:
+        _diamond_outline(_flash_cell, Color(1.0, 0.2, 0.2, clampf(_flash_left * 2.0, 0.0, 1.0)))
+
+    var items: Array = []
+    for t in TREE_CELLS:
+        items.append({"y": grid_to_world(t).y, "fn": _draw_tree.bind(t)})
+    for p in _plots:
+        items.append({"y": grid_to_world(p.cell).y, "fn": _draw_plot.bind(p)})
+    items.append({"y": grid_to_world(COOP_CELL).y, "fn": _draw_coop})
+    items.append({"y": grid_to_world(DELIVERY_CELL).y, "fn": _draw_delivery})
+    items.append({"y": _pos.y, "fn": _draw_farmer})
+    items.sort_custom(func(a, b): return a["y"] < b["y"])
+    for item in items:
+        item["fn"].call()
+
+
+func _draw_tree(cell: Vector2i) -> void:
+    var c := grid_to_world(cell)
+    _entities.draw_rect(Rect2(c.x - 7.0, c.y - 46.0, 14.0, 46.0), Color(0.42, 0.28, 0.16))
+    _entities.draw_circle(c + Vector2(0, -64), 34.0, Color(0.14, 0.45, 0.20))
+    _entities.draw_circle(c + Vector2(-14, -52), 22.0, Color(0.18, 0.52, 0.24))
+
+
+func _draw_plot(p: Plot) -> void:
+    var c := grid_to_world(p.cell)
+    _entities.draw_colored_polygon(_diamond_points(c, 0.92), Color(0.45, 0.30, 0.17))
+    if p.state == PLOT_GROWING:
+        var t := 1.0 - p.grow_left / CROP_GROW_TIME
+        var h := lerpf(6.0, 26.0, t)
+        _entities.draw_line(c + Vector2(0, 4), c + Vector2(0, 4.0 - h), Color(0.2, 0.65, 0.2), 4.0)
+        _entities.draw_circle(c + Vector2(-8, 2.0 - h * 0.6), 5.0 + 3.0 * t, Color(0.25, 0.70, 0.25))
+        _entities.draw_circle(c + Vector2(8, 2.0 - h * 0.8), 5.0 + 3.0 * t, Color(0.25, 0.70, 0.25))
+    elif p.state == PLOT_READY:
+        _entities.draw_line(c + Vector2(0, 4), c + Vector2(0, -26), Color(0.2, 0.6, 0.2), 4.0)
+        _entities.draw_circle(c + Vector2(-11, -12), 9.0, Color(0.85, 0.12, 0.10))
+        _entities.draw_circle(c + Vector2(11, -10), 9.0, Color(0.85, 0.12, 0.10))
+        _entities.draw_circle(c + Vector2(0, -26), 9.0, Color(0.90, 0.16, 0.12))
+
+
+func _draw_coop() -> void:
+    var c := grid_to_world(COOP_CELL)
+    _entities.draw_rect(Rect2(c.x - 38.0, c.y - 50.0, 76.0, 50.0), Color(0.70, 0.30, 0.22))
+    _entities.draw_colored_polygon(
+        PackedVector2Array([c + Vector2(-46, -50), c + Vector2(0, -86), c + Vector2(46, -50)]),
+        Color(0.45, 0.18, 0.14))
+    _entities.draw_rect(Rect2(c.x - 10.0, c.y - 28.0, 20.0, 28.0), Color(0.25, 0.14, 0.10))
+    for i in _eggs_ready:
+        _entities.draw_circle(c + Vector2(-30.0 + i * 20.0, 12), 8.0, Color(0.98, 0.96, 0.88))
+
+
+func _draw_delivery() -> void:
+    var c := grid_to_world(DELIVERY_CELL)
+    _entities.draw_rect(Rect2(c.x - 30.0, c.y - 36.0, 60.0, 36.0), Color(0.78, 0.62, 0.35))
+    _entities.draw_rect(Rect2(c.x - 30.0, c.y - 36.0, 60.0, 36.0), Color(0.45, 0.32, 0.15), false, 3.0)
+    _entities.draw_string(ThemeDB.fallback_font, c + Vector2(-60, -44), "DROP-OFF",
+        HORIZONTAL_ALIGNMENT_CENTER, 120.0, 20, Color.WHITE)
+
+
+func _draw_farmer() -> void:
+    var c := _pos
+    _entities.draw_circle(c + Vector2(0, 2), 14.0, Color(0, 0, 0, 0.25))
+    _entities.draw_rect(Rect2(c.x - 10.0, c.y - 34.0, 20.0, 30.0), Color(0.20, 0.35, 0.75))
+    _entities.draw_circle(c + Vector2(0, -44), 10.0, Color(0.95, 0.78, 0.62))
+    _entities.draw_rect(Rect2(c.x - 16.0, c.y - 52.0, 32.0, 5.0), Color(0.95, 0.80, 0.25))
+    _entities.draw_rect(Rect2(c.x - 8.0, c.y - 60.0, 16.0, 10.0), Color(0.95, 0.80, 0.25))
+    if _act_kind != "":
+        var frac := 1.0 - _act_left / _act_total
+        _entities.draw_rect(Rect2(c.x - 24.0, c.y - 78.0, 48.0, 9.0), Color(0, 0, 0, 0.6))
+        _entities.draw_rect(Rect2(c.x - 22.0, c.y - 76.0, 44.0 * frac, 5.0), Color(0.4, 0.9, 0.3))
