@@ -1,6 +1,6 @@
 extends Node2D
 
-const BUILD_NUMBER := 7
+const BUILD_NUMBER := 8
 
 # ---- Tunable gameplay values (seconds) ----
 const PLANT_TIME := 1.0
@@ -15,9 +15,10 @@ const GRACE_TIME := 15.0
 const FARMER_SPEED := 280.0
 const DRAG_THRESHOLD := 14.0
 
-# ---- Job queue size ----
+# ---- Job queue size and power-up ----
 const QUEUE_MAX_BASE := 4
 const QUEUE_MAX_BOOSTED := 8
+const POWERUP_TIME := 25.0
 
 # ---- Order waves (one entry per wave) ----
 const WAVE_TOMATOES: Array[int] = [2, 3, 3]
@@ -69,7 +70,7 @@ var _pos := Vector2.ZERO
 var _path: Array[Vector2i] = []
 var _order: Order = null
 var _queue: Array[Order] = []
-var _queue_boosted := false
+var _boost_left := 0.0
 
 var _act_kind := ""
 var _act_left := 0.0
@@ -98,6 +99,7 @@ var _toast_label: Label
 var _inv_label: Label
 var _timer_label: Label
 var _order_label: Label
+var _boost_label: Label
 var _pause_btn: Button
 var _queue_box: VBoxContainer
 var _queue_sig := ""
@@ -127,7 +129,7 @@ func _in_grid(c: Vector2i) -> bool:
 
 
 func _queue_max() -> int:
-    return QUEUE_MAX_BOOSTED if _queue_boosted else QUEUE_MAX_BASE
+    return QUEUE_MAX_BOOSTED if _boost_left > 0.0 else QUEUE_MAX_BASE
 
 
 func _ready() -> void:
@@ -197,6 +199,12 @@ func _build_hud() -> void:
     title.text = "Sunpatch Farm - Build %d\nTap to queue jobs\nDrag to scroll" % BUILD_NUMBER
     hud.add_child(title)
     title.position = Vector2(16, 12)
+
+    _boost_label = _make_label(24)
+    _boost_label.add_theme_color_override("font_color", Color(1.0, 0.85, 0.2))
+    _boost_label.visible = false
+    hud.add_child(_boost_label)
+    _boost_label.position = Vector2(16, 100)
 
     _inv_label = _make_label(28)
     _inv_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
@@ -318,12 +326,22 @@ func _update_hud() -> void:
         _timer_label.text = "GRACE  %d" % ceili(_time_left)
     else:
         _timer_label.text = "%d" % ceili(_time_left)
+
     var w := mini(_wave, WAVE_TOMATOES.size() - 1)
-    _order_label.text = "Order %d of %d\nTomatoes %d/%d    Eggs %d/%d    Reward $%d" % [
+    var txt := "Order %d of %d\nTomatoes %d/%d    Eggs %d/%d    Reward $%d" % [
         w + 1, WAVE_TOMATOES.size(),
         _del_tomatoes, WAVE_TOMATOES[w],
         _del_eggs, WAVE_EGGS[w],
         WAVE_REWARD[w]]
+    if _del_tomatoes == 0 and _del_eggs == 0:
+        txt += "\nDeliver it all in one trip for a queue boost!"
+    _order_label.text = txt
+
+    if _boost_left > 0.0:
+        _boost_label.visible = true
+        _boost_label.text = "QUEUE BOOST: %d jobs - %d s" % [QUEUE_MAX_BOOSTED, ceili(_boost_left)]
+    else:
+        _boost_label.visible = false
 
 
 func _toast(text: String) -> void:
@@ -455,6 +473,12 @@ func _tick_world(delta: float) -> void:
             _end_game(false)
             return
 
+    if _boost_left > 0.0:
+        _boost_left -= delta
+        if _boost_left <= 0.0:
+            _boost_left = 0.0
+            _toast("Queue boost ended")
+
     for p in _plots:
         if p.state == PLOT_GROWING:
             p.grow_left -= delta
@@ -570,18 +594,19 @@ func _finish_action() -> void:
             _eggs_ready = 0
         "deliver":
             var give := _deliverable()
+            var fresh := _del_tomatoes == 0 and _del_eggs == 0
             _tomatoes -= give.x
             _eggs -= give.y
             _del_tomatoes += give.x
             _del_eggs += give.y
             if _del_tomatoes >= WAVE_TOMATOES[_wave] and _del_eggs >= WAVE_EGGS[_wave]:
-                _complete_wave()
+                _complete_wave(fresh)
             else:
                 _toast("Delivered %d tomatoes, %d eggs" % [give.x, give.y])
     _after_action()
 
 
-func _complete_wave() -> void:
+func _complete_wave(perfect: bool) -> void:
     var reward := WAVE_REWARD[_wave]
     _money += reward
     _wave += 1
@@ -589,6 +614,9 @@ func _complete_wave() -> void:
     _del_eggs = 0
     if _wave >= WAVE_TOMATOES.size():
         _end_game(true)
+    elif perfect:
+        _boost_left = POWERUP_TIME
+        _toast("Perfect delivery! +$%d - queue boosted to %d jobs for %d s" % [reward, QUEUE_MAX_BOOSTED, int(POWERUP_TIME)])
     else:
         _toast("Order complete! +$%d - next customer is here" % reward)
 
