@@ -1,6 +1,6 @@
 extends Node2D
 
-const BUILD_NUMBER := 6
+const BUILD_NUMBER := 7
 
 # ---- Tunable gameplay values (seconds) ----
 const PLANT_TIME := 1.0
@@ -14,6 +14,10 @@ const MAIN_TIME := 90.0
 const GRACE_TIME := 15.0
 const FARMER_SPEED := 280.0
 const DRAG_THRESHOLD := 14.0
+
+# ---- Job queue size ----
+const QUEUE_MAX_BASE := 4
+const QUEUE_MAX_BOOSTED := 8
 
 # ---- Order waves (one entry per wave) ----
 const WAVE_TOMATOES: Array[int] = [2, 3, 3]
@@ -64,7 +68,8 @@ var _blocked: Array[Vector2i] = []
 var _pos := Vector2.ZERO
 var _path: Array[Vector2i] = []
 var _order: Order = null
-var _queued: Order = null
+var _queue: Array[Order] = []
+var _queue_boosted := false
 
 var _act_kind := ""
 var _act_left := 0.0
@@ -94,6 +99,8 @@ var _inv_label: Label
 var _timer_label: Label
 var _order_label: Label
 var _pause_btn: Button
+var _queue_box: VBoxContainer
+var _queue_sig := ""
 var _overlay: Control
 var _ov_title: Label
 var _ov_info: Label
@@ -117,6 +124,10 @@ func _world_to_cell(w: Vector2) -> Vector2i:
 
 func _in_grid(c: Vector2i) -> bool:
     return c.x >= 0 and c.y >= 0 and c.x < GRID_W and c.y < GRID_H
+
+
+func _queue_max() -> int:
+    return QUEUE_MAX_BOOSTED if _queue_boosted else QUEUE_MAX_BASE
 
 
 func _ready() -> void:
@@ -183,7 +194,7 @@ func _build_hud() -> void:
     add_child(hud)
 
     var title := _make_label(20)
-    title.text = "Sunpatch Farm - Build %d\nTap to move or work\nDrag to scroll" % BUILD_NUMBER
+    title.text = "Sunpatch Farm - Build %d\nTap to queue jobs\nDrag to scroll" % BUILD_NUMBER
     hud.add_child(title)
     title.position = Vector2(16, 12)
 
@@ -205,6 +216,15 @@ func _build_hud() -> void:
     hud.add_child(_order_label)
     _order_label.set_anchors_preset(Control.PRESET_TOP_WIDE)
     _order_label.offset_top = 66.0
+
+    _queue_box = VBoxContainer.new()
+    _queue_box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+    _queue_box.visible = false
+    hud.add_child(_queue_box)
+    _queue_box.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+    _queue_box.offset_left = -360.0
+    _queue_box.offset_right = -16.0
+    _queue_box.offset_top = 104.0
 
     _toast_label = _make_label(30)
     _toast_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -317,6 +337,96 @@ func _flash(cell: Vector2i) -> void:
     _flash_left = 0.6
 
 
+# ---------------- Job queue UI ----------------
+
+func _order_text(o: Order) -> String:
+    match o.kind:
+        "plot":
+            return "Tend plot"
+        "coop":
+            return "Collect eggs"
+        "delivery":
+            return "Deliver"
+    return "Go to tile"
+
+
+func _current_text() -> String:
+    if _act_kind != "":
+        match _act_kind:
+            "plant":
+                return "Now: Planting"
+            "harvest":
+                return "Now: Harvesting"
+            "collect":
+                return "Now: Collecting eggs"
+            "deliver":
+                return "Now: Delivering"
+        return "Now: Working"
+    if _order != null:
+        return "Now: " + _order_text(_order)
+    return ""
+
+
+func _add_queue_row(text: String, on_press: Callable) -> void:
+    var row := HBoxContainer.new()
+    row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+    var l := _make_label(22)
+    l.text = text
+    l.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+    row.add_child(l)
+    var b := Button.new()
+    b.text = "X"
+    b.custom_minimum_size = Vector2(52, 44)
+    b.add_theme_font_size_override("font_size", 22)
+    b.pressed.connect(on_press)
+    row.add_child(b)
+    _queue_box.add_child(row)
+
+
+func _refresh_queue_ui() -> void:
+    var cur := _current_text()
+    var sig := "%s|%d" % [cur, _queue_max()]
+    for q in _queue:
+        sig += "|" + _order_text(q)
+    if sig == _queue_sig:
+        return
+    _queue_sig = sig
+
+    for ch in _queue_box.get_children():
+        _queue_box.remove_child(ch)
+        ch.queue_free()
+
+    _queue_box.visible = cur != "" or not _queue.is_empty()
+    if not _queue_box.visible:
+        return
+
+    var header := _make_label(22)
+    header.text = "Jobs - queued %d of %d" % [_queue.size(), _queue_max()]
+    _queue_box.add_child(header)
+
+    if cur != "":
+        _add_queue_row(cur, _on_cancel_current_pressed)
+    for i in _queue.size():
+        _add_queue_row("%d. %s" % [i + 1, _order_text(_queue[i])], _on_remove_queued.bind(i))
+
+
+func _on_cancel_current_pressed() -> void:
+    if _paused or _game_state != STATE_PLAYING:
+        return
+    if not _is_busy():
+        return
+    _cancel_action()
+    _toast("Job cancelled")
+    _after_action()
+
+
+func _on_remove_queued(i: int) -> void:
+    if _paused or _game_state != STATE_PLAYING:
+        return
+    if i >= 0 and i < _queue.size():
+        _queue.remove_at(i)
+
+
 # ---------------- Game loop ----------------
 
 func _process(delta: float) -> void:
@@ -328,6 +438,7 @@ func _process(delta: float) -> void:
     if not _paused and _game_state == STATE_PLAYING:
         _tick_world(delta)
     _update_hud()
+    _refresh_queue_ui()
     _entities.queue_redraw()
 
 
@@ -378,6 +489,10 @@ func _move_farmer(delta: float) -> void:
             _arrive()
     else:
         _pos += (target - _pos).normalized() * step
+
+
+func _is_busy() -> bool:
+    return _order != null or _act_kind != ""
 
 
 func _arrive() -> void:
@@ -494,10 +609,11 @@ func _end_game(won: bool) -> void:
 func _after_action() -> void:
     if _game_state != STATE_PLAYING:
         return
-    if _queued != null:
-        var q := _queued
-        _queued = null
-        _start_order(q)
+    while not _queue.is_empty():
+        var q: Order = _queue[0]
+        _queue.remove_at(0)
+        if _start_order(q):
+            return
 
 
 # ---------------- Orders and pathfinding ----------------
@@ -521,10 +637,6 @@ func _order_for_cell(cell: Vector2i) -> Order:
     return o
 
 
-func _same_order(a: Order, b: Order) -> bool:
-    return a.kind == b.kind and a.cell == b.cell
-
-
 func _path_to_adjacent(target: Vector2i) -> Array[Vector2i]:
     var best: Array[Vector2i] = []
     var start := _world_to_cell(_pos)
@@ -540,7 +652,7 @@ func _path_to_adjacent(target: Vector2i) -> Array[Vector2i]:
     return best
 
 
-func _start_order(order: Order) -> void:
+func _start_order(order: Order) -> bool:
     var path: Array[Vector2i] = []
     if order.kind == "move":
         path = _astar.get_id_path(_world_to_cell(_pos), order.cell)
@@ -549,9 +661,10 @@ func _start_order(order: Order) -> void:
     if path.is_empty():
         _flash(order.cell)
         _toast("Can't reach that spot")
-        return
+        return false
     _order = order
     _path = path
+    return true
 
 
 func _cell_at_world(w: Vector2) -> Vector2i:
@@ -577,15 +690,11 @@ func _handle_tap(screen_pos: Vector2) -> void:
         _toast("Blocked")
         return
 
-    if _act_kind != "":
-        # Busy working: first tap queues, a different tap after that interrupts.
-        if _queued != null and not _same_order(_queued, order):
-            _cancel_action()
-            _queued = null
-            _start_order(order)
-        else:
-            _queued = order
-            _toast("Queued next job (tap elsewhere to interrupt)")
+    if _is_busy():
+        if _queue.size() >= _queue_max():
+            _toast("Queue full (%d jobs)" % _queue_max())
+            return
+        _queue.append(order)
     else:
         _start_order(order)
 
@@ -654,10 +763,10 @@ func _diamond_outline(cell: Vector2i, color: Color) -> void:
 
 
 func _draw_entities() -> void:
-    if _order != null and _order.kind == "move":
+    if _order != null:
         _diamond_outline(_order.cell, Color(1, 1, 1, 0.9))
-    if _queued != null:
-        _diamond_outline(_queued.cell, Color(1.0, 0.65, 0.1, 0.95))
+    for q in _queue:
+        _diamond_outline(q.cell, Color(1.0, 0.65, 0.1, 0.95))
     if _flash_left > 0.0:
         _diamond_outline(_flash_cell, Color(1.0, 0.2, 0.2, clampf(_flash_left * 2.0, 0.0, 1.0)))
 
@@ -672,6 +781,11 @@ func _draw_entities() -> void:
     items.sort_custom(func(a, b): return a["y"] < b["y"])
     for item in items:
         item["fn"].call()
+
+    for i in _queue.size():
+        var qc := grid_to_world(_queue[i].cell)
+        _entities.draw_string(ThemeDB.fallback_font, qc + Vector2(-20, 10), str(i + 1),
+            HORIZONTAL_ALIGNMENT_CENTER, 40.0, 30, Color.WHITE)
 
 
 func _draw_tree(cell: Vector2i) -> void:
