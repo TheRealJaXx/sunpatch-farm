@@ -1,0 +1,40 @@
+name: Build Android debug APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    container:
+      image: barichello/godot-ci:4.3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Godot paths
+        run: |
+          mkdir -v -p ~/.local/share/godot/export_templates/ ~/.config/
+          if [ "$HOME" != "/root" ]; then
+            mv /root/.config/godot ~/.config/godot
+            mv /root/.local/share/godot/export_templates/4.3.stable ~/.local/share/godot/export_templates/4.3.stable
+          fi
+          godot --version
+          ls ~/.config/godot ~/.local/share/godot/export_templates
+
+      - name: Import project
+        run: godot --headless --verbose --import || true
+
+      - name: Export debug APK
+        run: |
+          mkdir -v -p build/android
+          godot --headless --verbose --export-debug "Android" build/android/sunpatch-farm-debug.apk
+          ls -la build/android
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: sunpatch-farm-debug-apk
+          path: build/android/sunpatch-farm-debug.apk
+          retention-days: 30
