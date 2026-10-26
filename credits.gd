@@ -2,7 +2,7 @@ extends Control
 
 const FADE_SECONDS := 0.8
 const HOLD_SECONDS := 1.4
-const NEXT_SCENE := "res://farm.tscn"
+const NEXT_SCENE := "res://menu.tscn"
 const LOGO_WIDTH := 1100.0
 
 var _done := false
