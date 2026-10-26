@@ -1,6 +1,6 @@
 extends Node2D
 
-const BUILD_NUMBER := 8
+const BUILD_NUMBER := 9
 
 # ---- Tunable gameplay values (seconds) ----
 const PLANT_TIME := 1.0
@@ -20,10 +20,16 @@ const QUEUE_MAX_BASE := 4
 const QUEUE_MAX_BOOSTED := 8
 const POWERUP_TIME := 25.0
 
-# ---- Order waves (one entry per wave) ----
-const WAVE_TOMATOES: Array[int] = [2, 3, 3]
-const WAVE_EGGS: Array[int] = [1, 2, 2]
-const WAVE_REWARD: Array[int] = [20, 40, 60]
+# ---- Money, shop and soil blocks ----
+const START_MONEY := 0
+const RUSH_FEE := 0.25
+const PLOT_PRICES: Array[int] = [200, 350, 500]
+const NEW_PLOT_CELLS: Array[Vector2i] = [Vector2i(2, 5), Vector2i(2, 7), Vector2i(2, 9)]
+
+# ---- Rounds: one list per round, one entry per order ----
+const ROUND_TOMATOES: Array = [[2, 3, 3], [3, 3, 4], [4, 4, 5]]
+const ROUND_EGGS: Array = [[1, 2, 2], [2, 2, 2], [2, 3, 3]]
+const ROUND_REWARD: Array = [[20, 30, 40], [30, 40, 50], [40, 50, 60]]
 
 # ---- Map ----
 const GRID_W := 14
@@ -49,6 +55,7 @@ const PLOT_READY := 2
 const STATE_PLAYING := 0
 const STATE_WON := 1
 const STATE_LOST := 2
+const STATE_SHOP := 3
 
 class Plot:
     var cell: Vector2i = Vector2i.ZERO
@@ -81,7 +88,12 @@ var _tomatoes := 0
 var _eggs := 0
 var _eggs_ready := 0
 var _egg_timer := 0.0
-var _money := 0
+var _money := START_MONEY
+
+var _round := 0
+var _owned_extra := 0
+var _snap_money := 0
+var _snap_extra := 0
 
 var _wave := 0
 var _del_tomatoes := 0
@@ -106,8 +118,8 @@ var _queue_sig := ""
 var _overlay: Control
 var _ov_title: Label
 var _ov_info: Label
-var _resume_btn: Button
-var _restart_btn: Button
+var _ov_buttons: Array[Button] = []
+var _ov_mode := ""
 
 var _press_active := false
 var _press_pos := Vector2.ZERO
@@ -132,9 +144,39 @@ func _queue_max() -> int:
     return QUEUE_MAX_BOOSTED if _boost_left > 0.0 else QUEUE_MAX_BASE
 
 
+# ---- Round data helpers ----
+
+func _wave_count() -> int:
+    return int(ROUND_TOMATOES[_round].size())
+
+
+func _need_t(i: int) -> int:
+    return int(ROUND_TOMATOES[_round][i])
+
+
+func _need_e(i: int) -> int:
+    return int(ROUND_EGGS[_round][i])
+
+
+func _reward(i: int) -> int:
+    return int(ROUND_REWARD[_round][i])
+
+
+# ---- Soil block helpers ----
+
+func _next_slot_exists() -> bool:
+    return _owned_extra < NEW_PLOT_CELLS.size()
+
+
+func _price(rush: bool) -> int:
+    var base: int = PLOT_PRICES[_owned_extra]
+    if rush:
+        return roundi(base * (1.0 + RUSH_FEE))
+    return base
+
+
 func _ready() -> void:
     _build_map_data()
-    _pos = grid_to_world(START_CELL)
 
     _entities = Node2D.new()
     add_child(_entities)
@@ -148,11 +190,12 @@ func _ready() -> void:
     _build_hud()
     _clamp_camera()
     queue_redraw()
-    _toast("Order 1 is in! Grow tomatoes, collect eggs, deliver.")
+    _start_round()
 
 
 func _build_map_data() -> void:
     _blocked.clear()
+    _plots.clear()
     for tree_cell in TREE_CELLS:
         _blocked.append(tree_cell)
     for plot_cell in PLOT_CELLS:
@@ -160,6 +203,11 @@ func _build_map_data() -> void:
         p.cell = plot_cell
         _plots.append(p)
         _blocked.append(plot_cell)
+    for i in _owned_extra:
+        var ep := Plot.new()
+        ep.cell = NEW_PLOT_CELLS[i]
+        _plots.append(ep)
+        _blocked.append(NEW_PLOT_CELLS[i])
     _blocked.append(COOP_CELL)
     _blocked.append(DELIVERY_CELL)
 
@@ -170,6 +218,61 @@ func _build_map_data() -> void:
     _astar.update()
     for blocked_cell in _blocked:
         _astar.set_point_solid(blocked_cell, true)
+
+
+# ---------------- Rounds ----------------
+
+func _start_round() -> void:
+    _game_state = STATE_PLAYING
+    _paused = false
+    _wave = 0
+    _del_tomatoes = 0
+    _del_eggs = 0
+    _tomatoes = 0
+    _eggs = 0
+    _eggs_ready = 0
+    _egg_timer = 0.0
+    _time_left = MAIN_TIME
+    _in_grace = false
+    _boost_left = 0.0
+    _timer_label.remove_theme_color_override("font_color")
+    _queue.clear()
+    _cancel_action()
+    _pos = grid_to_world(START_CELL)
+    for p in _plots:
+        p.state = PLOT_EMPTY
+        p.grow_left = 0.0
+    _snap_money = _money
+    _snap_extra = _owned_extra
+    _overlay.visible = false
+    _pause_btn.visible = true
+    _queue_sig = ""
+    _toast("Round %d - Order 1 is in! Grow, collect, deliver." % (_round + 1))
+
+
+func _restart_round() -> void:
+    _money = _snap_money
+    _owned_extra = _snap_extra
+    _build_map_data()
+    _start_round()
+
+
+func _start_next_round() -> void:
+    _round += 1
+    _start_round()
+
+
+func _end_round() -> void:
+    _queue.clear()
+    _cancel_action()
+    if _round >= ROUND_TOMATOES.size() - 1:
+        _game_state = STATE_WON
+        _show_overlay("win", "YOU WIN!",
+            "All %d rounds complete!\nMoney: $%d" % [ROUND_TOMATOES.size(), _money],
+            ["Play again"])
+    else:
+        _game_state = STATE_SHOP
+        _show_shop()
 
 
 # ---------------- HUD ----------------
@@ -275,7 +378,7 @@ func _build_overlay(hud: CanvasLayer) -> void:
     box.add_theme_constant_override("separation", 20)
     center.add_child(box)
 
-    _ov_title = _make_label(72)
+    _ov_title = _make_label(64)
     _ov_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
     box.add_child(_ov_title)
 
@@ -283,41 +386,122 @@ func _build_overlay(hud: CanvasLayer) -> void:
     _ov_info.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
     box.add_child(_ov_info)
 
-    _resume_btn = _make_button("Resume", 320.0)
-    _resume_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
-    _resume_btn.pressed.connect(_on_resume_pressed)
-    box.add_child(_resume_btn)
-
-    _restart_btn = _make_button("Restart", 320.0)
-    _restart_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
-    _restart_btn.pressed.connect(_on_restart_pressed)
-    box.add_child(_restart_btn)
+    for i in 3:
+        var b := _make_button("", 440.0)
+        b.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+        b.pressed.connect(_on_ov_button.bind(i))
+        box.add_child(b)
+        _ov_buttons.append(b)
 
 
-func _show_overlay(title: String, info: String, can_resume: bool, restart_text: String) -> void:
+func _show_overlay(mode: String, title: String, info: String, labels: Array[String]) -> void:
+    _ov_mode = mode
     _ov_title.text = title
     _ov_info.text = info
-    _resume_btn.visible = can_resume
-    _restart_btn.text = restart_text
+    for i in 3:
+        var b := _ov_buttons[i]
+        if i < labels.size() and labels[i] != "":
+            b.text = labels[i]
+            b.disabled = false
+            b.visible = true
+        else:
+            b.visible = false
     _overlay.visible = true
     _pause_btn.visible = false
+
+
+func _close_overlay() -> void:
+    _paused = false
+    _overlay.visible = false
+    _pause_btn.visible = true
+
+
+func _on_ov_button(i: int) -> void:
+    match _ov_mode:
+        "pause":
+            if i == 0:
+                _close_overlay()
+            elif i == 1:
+                _restart_round()
+        "confirm":
+            if i == 0:
+                _do_buy(true)
+            else:
+                _close_overlay()
+        "shop":
+            if i == 0:
+                _do_buy(false)
+            elif i == 1:
+                _start_next_round()
+        "win":
+            get_tree().reload_current_scene()
+        "lose":
+            if i == 0:
+                _restart_round()
+            else:
+                get_tree().reload_current_scene()
 
 
 func _on_pause_pressed() -> void:
     if _game_state != STATE_PLAYING or _paused:
         return
     _paused = true
-    _show_overlay("PAUSED", "The game clock is stopped.", true, "Restart")
+    _show_overlay("pause", "PAUSED", "The game clock is stopped.", ["Resume", "Restart round"])
 
 
-func _on_resume_pressed() -> void:
-    _paused = false
-    _overlay.visible = false
-    _pause_btn.visible = true
+func _show_shop() -> void:
+    var labels: Array[String] = []
+    if _next_slot_exists():
+        labels.append("Buy soil block - $%d" % _price(false))
+    else:
+        labels.append("All soil blocks bought")
+    labels.append("Start round %d" % (_round + 2))
+    _show_overlay("shop", "ROUND %d COMPLETE" % (_round + 1),
+        "Money: $%d\nSoil blocks bought: %d of %d" % [_money, _owned_extra, NEW_PLOT_CELLS.size()],
+        labels)
+    var can_buy := _next_slot_exists() and _money >= _price(false)
+    _ov_buttons[0].disabled = not can_buy
 
 
-func _on_restart_pressed() -> void:
-    get_tree().reload_current_scene()
+func _open_buy_confirm() -> void:
+    var cost := _price(true)
+    _paused = true
+    _show_overlay("confirm", "Buy soil block?",
+        "Cost: $%d (includes %d%% rush fee)\nYou have: $%d" % [cost, roundi(RUSH_FEE * 100.0), _money],
+        ["Buy for $%d" % cost, "Cancel"])
+    _ov_buttons[0].disabled = _money < cost
+
+
+func _do_buy(rush: bool) -> void:
+    if not _next_slot_exists():
+        return
+    var cost := _price(rush)
+    if _money < cost:
+        return
+    var cell := NEW_PLOT_CELLS[_owned_extra]
+    if rush and _world_to_cell(_pos) == cell:
+        _toast("Move the farmer off that spot first")
+        _close_overlay()
+        return
+
+    _money -= cost
+    _owned_extra += 1
+    var p := Plot.new()
+    p.cell = cell
+    _plots.append(p)
+    _blocked.append(cell)
+    _astar.set_point_solid(cell, true)
+
+    if rush:
+        _toast("Soil block bought for $%d" % cost)
+        _close_overlay()
+        var o := _order
+        if o != null and _act_kind == "":
+            if not _start_order(o):
+                _cancel_action()
+                _after_action()
+    else:
+        _show_shop()
 
 
 func _update_hud() -> void:
@@ -327,12 +511,12 @@ func _update_hud() -> void:
     else:
         _timer_label.text = "%d" % ceili(_time_left)
 
-    var w := mini(_wave, WAVE_TOMATOES.size() - 1)
-    var txt := "Order %d of %d\nTomatoes %d/%d    Eggs %d/%d    Reward $%d" % [
-        w + 1, WAVE_TOMATOES.size(),
-        _del_tomatoes, WAVE_TOMATOES[w],
-        _del_eggs, WAVE_EGGS[w],
-        WAVE_REWARD[w]]
+    var w := mini(_wave, _wave_count() - 1)
+    var txt := "Round %d of %d - Order %d of %d\nTomatoes %d/%d    Eggs %d/%d    Reward $%d" % [
+        _round + 1, ROUND_TOMATOES.size(), w + 1, _wave_count(),
+        _del_tomatoes, _need_t(w),
+        _del_eggs, _need_e(w),
+        _reward(w)]
     if _del_tomatoes == 0 and _del_eggs == 0:
         txt += "\nDeliver it all in one trip for a queue boost!"
     _order_label.text = txt
@@ -470,7 +654,7 @@ func _tick_world(delta: float) -> void:
             _toast("Time's up! Grace period - finish your orders!")
         else:
             _time_left = 0.0
-            _end_game(false)
+            _game_over()
             return
 
     if _boost_left > 0.0:
@@ -499,6 +683,13 @@ func _tick_world(delta: float) -> void:
         return
 
     _move_farmer(delta)
+
+
+func _game_over() -> void:
+    _game_state = STATE_LOST
+    _show_overlay("lose", "TIME'S UP",
+        "Round %d - orders completed: %d of %d" % [_round + 1, _wave, _wave_count()],
+        ["Retry round", "New game"])
 
 
 func _move_farmer(delta: float) -> void:
@@ -545,8 +736,8 @@ func _arrive() -> void:
 
 func _deliverable() -> Vector2i:
     return Vector2i(
-        mini(_tomatoes, WAVE_TOMATOES[_wave] - _del_tomatoes),
-        mini(_eggs, WAVE_EGGS[_wave] - _del_eggs))
+        mini(_tomatoes, _need_t(_wave) - _del_tomatoes),
+        mini(_eggs, _need_e(_wave) - _del_eggs))
 
 
 func _begin_plot_action(p: Plot) -> void:
@@ -599,7 +790,7 @@ func _finish_action() -> void:
             _eggs -= give.y
             _del_tomatoes += give.x
             _del_eggs += give.y
-            if _del_tomatoes >= WAVE_TOMATOES[_wave] and _del_eggs >= WAVE_EGGS[_wave]:
+            if _del_tomatoes >= _need_t(_wave) and _del_eggs >= _need_e(_wave):
                 _complete_wave(fresh)
             else:
                 _toast("Delivered %d tomatoes, %d eggs" % [give.x, give.y])
@@ -607,31 +798,18 @@ func _finish_action() -> void:
 
 
 func _complete_wave(perfect: bool) -> void:
-    var reward := WAVE_REWARD[_wave]
+    var reward := _reward(_wave)
     _money += reward
     _wave += 1
     _del_tomatoes = 0
     _del_eggs = 0
-    if _wave >= WAVE_TOMATOES.size():
-        _end_game(true)
+    if _wave >= _wave_count():
+        _end_round()
     elif perfect:
         _boost_left = POWERUP_TIME
         _toast("Perfect delivery! +$%d - queue boosted to %d jobs for %d s" % [reward, QUEUE_MAX_BOOSTED, int(POWERUP_TIME)])
     else:
         _toast("Order complete! +$%d - next customer is here" % reward)
-
-
-func _end_game(won: bool) -> void:
-    if won:
-        _game_state = STATE_WON
-        _show_overlay("YOU WIN!",
-            "All %d orders delivered!\nMoney earned: $%d\nTime left: %d s" % [WAVE_TOMATOES.size(), _money, ceili(_time_left)],
-            false, "Play again")
-    else:
-        _game_state = STATE_LOST
-        _show_overlay("TIME'S UP",
-            "Orders completed: %d of %d\nMoney earned: $%d" % [_wave, WAVE_TOMATOES.size(), _money],
-            false, "Try again")
 
 
 func _after_action() -> void:
@@ -712,6 +890,11 @@ func _handle_tap(screen_pos: Vector2) -> void:
     var cell := _cell_at_world(world)
     if not _in_grid(cell):
         return
+
+    if _next_slot_exists() and cell == NEW_PLOT_CELLS[_owned_extra]:
+        _open_buy_confirm()
+        return
+
     var order := _order_for_cell(cell)
     if order == null:
         _flash(cell)
@@ -798,6 +981,9 @@ func _draw_entities() -> void:
     if _flash_left > 0.0:
         _diamond_outline(_flash_cell, Color(1.0, 0.2, 0.2, clampf(_flash_left * 2.0, 0.0, 1.0)))
 
+    if _next_slot_exists() and _game_state == STATE_PLAYING:
+        _draw_forsale()
+
     var items: Array = []
     for t in TREE_CELLS:
         items.append({"y": grid_to_world(t).y, "fn": _draw_tree.bind(t)})
@@ -814,6 +1000,16 @@ func _draw_entities() -> void:
         var qc := grid_to_world(_queue[i].cell)
         _entities.draw_string(ThemeDB.fallback_font, qc + Vector2(-20, 10), str(i + 1),
             HORIZONTAL_ALIGNMENT_CENTER, 40.0, 30, Color.WHITE)
+
+
+func _draw_forsale() -> void:
+    var c := grid_to_world(NEW_PLOT_CELLS[_owned_extra])
+    _entities.draw_colored_polygon(_diamond_points(c, 0.92), Color(0.45, 0.30, 0.17, 0.35))
+    var pts := _diamond_points(c, 0.92)
+    pts.append(pts[0])
+    _entities.draw_polyline(pts, Color(1.0, 0.85, 0.2), 3.0)
+    _entities.draw_string(ThemeDB.fallback_font, c + Vector2(-60, 7), "SOIL $%d" % _price(true),
+        HORIZONTAL_ALIGNMENT_CENTER, 120.0, 20, Color(1.0, 0.95, 0.5))
 
 
 func _draw_tree(cell: Vector2i) -> void:
