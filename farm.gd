@@ -1,6 +1,6 @@
 extends Node2D
 
-const BUILD_NUMBER := 10
+const BUILD_NUMBER := 11
 
 # ---- Tunable gameplay values (seconds) ----
 const PLANT_TIME := 1.0
@@ -12,14 +12,19 @@ const MAIN_TIME := 90.0
 const GRACE_TIME := 15.0
 const DRAG_THRESHOLD := 14.0
 
+# ---- Crops: 0 = tomato, 1 = corn. Grow time per fertilizer level ----
+const CROP_TOMATO := 0
+const CROP_CORN := 1
+const CROP_GROW: Array = [[8.0, 6.0, 4.0], [12.0, 9.0, 6.0]]
+const CORN_FROM_ROUND := 2
+
 # ---- Upgrades: index = level (0 = base) ----
 const UP_NAMES: Array[String] = ["Hens", "Fertilizer", "Boots"]
 const UP_COSTS: Array = [[100, 200], [120, 240], [80, 160]]
 const EGG_TIMES: Array[float] = [12.0, 9.0, 6.0]
-const GROW_TIMES: Array[float] = [8.0, 6.0, 4.0]
 const SPEEDS: Array[float] = [280.0, 350.0, 420.0]
 
-# ---- Stars ----
+# ---- Stars and saving ----
 const STAR3_TIME_LEFT := 25.0
 const STAR_BONUS := 10
 const SAVE_PATH := "user://sunpatch_save.cfg"
@@ -32,13 +37,18 @@ const POWERUP_TIME := 25.0
 # ---- Money, shop and soil blocks ----
 const START_MONEY := 0
 const RUSH_FEE := 0.25
-const PLOT_PRICES: Array[int] = [200, 350, 500]
-const NEW_PLOT_CELLS: Array[Vector2i] = [Vector2i(2, 5), Vector2i(2, 7), Vector2i(2, 9)]
+const PLOT_PRICES: Array[int] = [200, 350, 500, 700, 900]
+const NEW_PLOT_CELLS: Array[Vector2i] = [Vector2i(2, 5), Vector2i(2, 7), Vector2i(2, 9), Vector2i(4, 3), Vector2i(4, 11)]
 
 # ---- Rounds: one list per round, one entry per order ----
-const ROUND_TOMATOES: Array = [[2, 3, 3], [3, 3, 4], [4, 4, 5]]
-const ROUND_EGGS: Array = [[1, 2, 2], [2, 2, 2], [2, 3, 3]]
-const ROUND_REWARD: Array = [[20, 30, 40], [30, 40, 50], [40, 50, 60]]
+const ROUND_COUNT := 5
+const ROUND_TOMATOES: Array = [[2, 3, 3], [3, 3, 4], [3, 3, 3], [3, 3, 4], [3, 4, 4]]
+const ROUND_CORN: Array = [[0, 0, 0], [0, 0, 0], [1, 2, 2], [2, 2, 3], [2, 3, 3]]
+const ROUND_EGGS: Array = [[1, 2, 2], [2, 2, 2], [2, 2, 3], [2, 3, 3], [2, 3, 3]]
+const ROUND_REWARD: Array = [[20, 30, 40], [30, 40, 50], [40, 50, 60], [50, 60, 70], [60, 70, 90]]
+
+# ---- Audio ----
+const MIX_RATE := 22050
 
 # ---- Map ----
 const GRID_W := 14
@@ -48,6 +58,7 @@ const TILE_H := 64.0
 const COLOR_A := Color(0.45, 0.75, 0.36)
 const COLOR_B := Color(0.40, 0.69, 0.32)
 const COLOR_EDGE := Color(0.25, 0.50, 0.22)
+const COLOR_FENCE := Color(0.40, 0.26, 0.14)
 const MAP_BOUNDS := Rect2(-896.0, -32.0, 1792.0, 896.0)
 
 const DIRS: Array[Vector2i] = [Vector2i(1, 0), Vector2i(-1, 0), Vector2i(0, 1), Vector2i(0, -1)]
@@ -69,6 +80,7 @@ const STATE_SHOP := 3
 class Plot:
     var cell: Vector2i = Vector2i.ZERO
     var state: int = 0
+    var crop: int = 0
     var grow_left: float = 0.0
 
 class Order:
@@ -94,10 +106,12 @@ var _act_total := 1.0
 var _act_plot: Plot = null
 
 var _tomatoes := 0
+var _corn := 0
 var _eggs := 0
 var _eggs_ready := 0
 var _egg_timer := 0.0
 var _money := START_MONEY
+var _sel_crop := CROP_TOMATO
 
 var _round := 0
 var _owned_extra := 0
@@ -106,18 +120,27 @@ var _snap_money := 0
 var _snap_extra := 0
 var _snap_lv: Array[int] = [0, 0, 0]
 
-var _run_stars: Array[int] = [0, 0, 0]
-var _best_stars: Array[int] = [0, 0, 0]
+var _run_stars: Array[int] = [0, 0, 0, 0, 0]
+var _best_stars: Array[int] = [0, 0, 0, 0, 0]
 var _best_money := 0
 var _round_summary := ""
+var _muted := false
 
 var _wave := 0
-var _del_tomatoes := 0
-var _del_eggs := 0
+var _del_t := 0
+var _del_c := 0
+var _del_e := 0
 var _time_left := MAIN_TIME
 var _in_grace := false
 var _game_state := STATE_PLAYING
 var _paused := false
+var _last_tick_sec := -1
+
+var _anim := 0.0
+var _pops: Array = []
+var _sounds := {}
+var _players: Array[AudioStreamPlayer] = []
+var _player_idx := 0
 
 var _flash_cell := Vector2i.ZERO
 var _flash_left := 0.0
@@ -129,6 +152,7 @@ var _timer_label: Label
 var _order_label: Label
 var _boost_label: Label
 var _pause_btn: Button
+var _crop_btn: Button
 var _queue_box: VBoxContainer
 var _queue_sig := ""
 var _overlay: Control
@@ -166,8 +190,8 @@ func _egg_time() -> float:
     return EGG_TIMES[_lv[0]]
 
 
-func _grow_time() -> float:
-    return GROW_TIMES[_lv[1]]
+func _grow_time(crop: int) -> float:
+    return float(CROP_GROW[crop][_lv[1]])
 
 
 func _speed() -> float:
@@ -189,7 +213,8 @@ func _upgrade_label(u: int) -> String:
     if u == 0:
         return "Hens: egg every %ds - $%d" % [int(EGG_TIMES[next_lv]), cost]
     if u == 1:
-        return "Fertilizer: crops grow in %ds - $%d" % [int(GROW_TIMES[next_lv]), cost]
+        return "Fertilizer: tomato %ds, corn %ds - $%d" % [
+            int(CROP_GROW[0][next_lv]), int(CROP_GROW[1][next_lv]), cost]
     return "Boots: walk +%d%% - $%d" % [roundi((SPEEDS[next_lv] / SPEEDS[0] - 1.0) * 100.0), cost]
 
 
@@ -199,6 +224,7 @@ func _buy_upgrade(u: int) -> void:
         return
     _money -= cost
     _lv[u] += 1
+    _sfx("buy")
     _show_shop()
 
 
@@ -212,12 +238,20 @@ func _need_t(i: int) -> int:
     return int(ROUND_TOMATOES[_round][i])
 
 
+func _need_c(i: int) -> int:
+    return int(ROUND_CORN[_round][i])
+
+
 func _need_e(i: int) -> int:
     return int(ROUND_EGGS[_round][i])
 
 
 func _reward(i: int) -> int:
     return int(ROUND_REWARD[_round][i])
+
+
+func _corn_unlocked() -> bool:
+    return _round >= CORN_FROM_ROUND
 
 
 # ---- Soil block helpers ----
@@ -239,17 +273,26 @@ func _load_game() -> void:
     var cf := ConfigFile.new()
     if cf.load(SAVE_PATH) != OK:
         return
-    for i in 3:
+    for i in ROUND_COUNT:
         _best_stars[i] = int(cf.get_value("best", "round%d" % i, 0))
     _best_money = int(cf.get_value("best", "money", 0))
+    _muted = bool(cf.get_value("settings", "muted", false))
 
 
 func _save_game() -> void:
     var cf := ConfigFile.new()
-    for i in 3:
+    for i in ROUND_COUNT:
         cf.set_value("best", "round%d" % i, _best_stars[i])
     cf.set_value("best", "money", _best_money)
+    cf.set_value("settings", "muted", _muted)
     cf.save(SAVE_PATH)
+
+
+func _best_total() -> int:
+    var total := 0
+    for s in _best_stars:
+        total += s
+    return total
 
 
 func _calc_stars() -> int:
@@ -264,8 +307,68 @@ func _stars_text(n: int) -> String:
     return "[" + "*".repeat(n) + "-".repeat(3 - n) + "]"
 
 
+# ---- Audio ----
+
+func _make_stream(notes: Array, vol: float) -> AudioStreamWAV:
+    var samples := PackedFloat32Array()
+    for n in notes:
+        var f0: float = n[0]
+        var f1: float = n[1]
+        var dur: float = n[2]
+        var count := int(dur * MIX_RATE)
+        var phase := 0.0
+        for i in count:
+            var t := float(i) / float(count)
+            var f := lerpf(f0, f1, t)
+            phase += TAU * f / float(MIX_RATE)
+            var env := minf(1.0, minf(t * 12.0, (1.0 - t) * 8.0))
+            samples.append(sin(phase) * env * vol)
+    var data := PackedByteArray()
+    data.resize(samples.size() * 2)
+    for i in samples.size():
+        data.encode_s16(i * 2, int(clampf(samples[i], -1.0, 1.0) * 32000.0))
+    var s := AudioStreamWAV.new()
+    s.format = AudioStreamWAV.FORMAT_16_BITS
+    s.mix_rate = MIX_RATE
+    s.stereo = false
+    s.data = data
+    return s
+
+
+func _init_audio() -> void:
+    _sounds["plant"] = _make_stream([[330.0, 260.0, 0.08]], 0.35)
+    _sounds["harvest"] = _make_stream([[520.0, 700.0, 0.10]], 0.35)
+    _sounds["collect"] = _make_stream([[700.0, 900.0, 0.07], [900.0, 700.0, 0.07]], 0.30)
+    _sounds["deliver"] = _make_stream([[440.0, 440.0, 0.08], [660.0, 660.0, 0.12]], 0.35)
+    _sounds["coin"] = _make_stream([[880.0, 880.0, 0.07], [1320.0, 1320.0, 0.18]], 0.30)
+    _sounds["buy"] = _make_stream([[1100.0, 1100.0, 0.06], [740.0, 740.0, 0.06], [980.0, 980.0, 0.12]], 0.30)
+    _sounds["win"] = _make_stream([[523.0, 523.0, 0.14], [659.0, 659.0, 0.14], [784.0, 784.0, 0.14], [1047.0, 1047.0, 0.35]], 0.35)
+    _sounds["lose"] = _make_stream([[392.0, 330.0, 0.25], [330.0, 262.0, 0.25], [262.0, 196.0, 0.45]], 0.35)
+    _sounds["tick"] = _make_stream([[1000.0, 1000.0, 0.04]], 0.20)
+    _sounds["click"] = _make_stream([[600.0, 500.0, 0.04]], 0.25)
+    _sounds["error"] = _make_stream([[200.0, 160.0, 0.12]], 0.30)
+    for i in 4:
+        var p := AudioStreamPlayer.new()
+        add_child(p)
+        _players.append(p)
+
+
+func _sfx(sound_name: String) -> void:
+    if _muted or not _sounds.has(sound_name) or _players.is_empty():
+        return
+    var p: AudioStreamPlayer = _players[_player_idx]
+    _player_idx = (_player_idx + 1) % _players.size()
+    p.stream = _sounds[sound_name]
+    p.play()
+
+
+func _sound_label() -> String:
+    return "Sound: Off" if _muted else "Sound: On"
+
+
 func _ready() -> void:
     _load_game()
+    _init_audio()
     _build_map_data()
 
     _entities = Node2D.new()
@@ -316,21 +419,28 @@ func _start_round() -> void:
     _game_state = STATE_PLAYING
     _paused = false
     _wave = 0
-    _del_tomatoes = 0
-    _del_eggs = 0
+    _del_t = 0
+    _del_c = 0
+    _del_e = 0
     _tomatoes = 0
+    _corn = 0
     _eggs = 0
     _eggs_ready = 0
     _egg_timer = 0.0
     _time_left = MAIN_TIME
     _in_grace = false
+    _last_tick_sec = -1
     _boost_left = 0.0
+    _sel_crop = CROP_TOMATO
+    _crop_btn.text = "Plant: Tomato"
     _timer_label.remove_theme_color_override("font_color")
     _queue.clear()
+    _pops.clear()
     _cancel_action()
     _pos = grid_to_world(START_CELL)
     for p in _plots:
         p.state = PLOT_EMPTY
+        p.crop = CROP_TOMATO
         p.grow_left = 0.0
     _snap_money = _money
     _snap_extra = _owned_extra
@@ -339,7 +449,12 @@ func _start_round() -> void:
     _overlay.visible = false
     _pause_btn.visible = true
     _queue_sig = ""
-    _toast("Round %d - finish with %ds+ left for 3 stars!" % [_round + 1, int(STAR3_TIME_LEFT)])
+    if _round == 0 and _best_total() == 0:
+        _toast("Tap a brown plot to plant, tap it again when ripe. Coop = eggs. Crate = deliver.", 5.0)
+    elif _round == CORN_FROM_ROUND:
+        _toast("Customers now want CORN! Use the Plant button to switch crops.", 5.0)
+    else:
+        _toast("Round %d - finish with %ds+ left for 3 stars!" % [_round + 1, int(STAR3_TIME_LEFT)])
 
 
 func _restart_round() -> void:
@@ -368,7 +483,7 @@ func _end_round() -> void:
     _round_summary = "Stars: %s  (+$%d bonus)   Best: %s" % [
         _stars_text(stars), bonus, _stars_text(_best_stars[_round])]
 
-    if _round >= ROUND_TOMATOES.size() - 1:
+    if _round >= ROUND_COUNT - 1:
         if _money > _best_money:
             _best_money = _money
         _save_game()
@@ -376,13 +491,16 @@ func _end_round() -> void:
         for s in _run_stars:
             total += s
         _game_state = STATE_WON
+        _sfx("win")
+        var labels: Array[String] = ["Play again", "Main menu"]
         _show_overlay("win", "YOU WIN!",
             "%s\nAll %d rounds complete!\nTotal stars: %d of %d\nMoney: $%d     Best money: $%d" % [
-                _round_summary, ROUND_TOMATOES.size(), total, ROUND_TOMATOES.size() * 3, _money, _best_money],
-            ["Play again"])
+                _round_summary, ROUND_COUNT, total, ROUND_COUNT * 3, _money, _best_money],
+            labels)
     else:
         _save_game()
         _game_state = STATE_SHOP
+        _sfx("coin")
         _show_shop()
 
 
@@ -446,15 +564,18 @@ func _build_hud() -> void:
     _queue_box.set_anchors_preset(Control.PRESET_TOP_RIGHT)
     _queue_box.offset_left = -360.0
     _queue_box.offset_right = -16.0
-    _queue_box.offset_top = 104.0
+    _queue_box.offset_top = 128.0
 
     _toast_label = _make_label(30)
     _toast_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
     _toast_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+    _toast_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
     hud.add_child(_toast_label)
     _toast_label.set_anchors_preset(Control.PRESET_BOTTOM_WIDE)
-    _toast_label.offset_top = -80.0
-    _toast_label.offset_bottom = -20.0
+    _toast_label.offset_left = 180.0
+    _toast_label.offset_right = -180.0
+    _toast_label.offset_top = -100.0
+    _toast_label.offset_bottom = -16.0
     _toast_label.modulate.a = 0.0
 
     _pause_btn = _make_button("Pause", 140.0)
@@ -465,6 +586,16 @@ func _build_hud() -> void:
     _pause_btn.offset_right = 156.0
     _pause_btn.offset_bottom = -16.0
     _pause_btn.pressed.connect(_on_pause_pressed)
+
+    _crop_btn = _make_button("Plant: Tomato", 240.0)
+    hud.add_child(_crop_btn)
+    _crop_btn.set_anchors_preset(Control.PRESET_BOTTOM_RIGHT)
+    _crop_btn.offset_left = -256.0
+    _crop_btn.offset_top = -80.0
+    _crop_btn.offset_right = -16.0
+    _crop_btn.offset_bottom = -16.0
+    _crop_btn.visible = false
+    _crop_btn.pressed.connect(_on_crop_pressed)
 
     _build_overlay(hud)
     _update_hud()
@@ -528,13 +659,24 @@ func _close_overlay() -> void:
     _pause_btn.visible = true
 
 
+func _go_menu() -> void:
+    get_tree().change_scene_to_file("res://menu.tscn")
+
+
 func _on_ov_button(i: int) -> void:
+    _sfx("click")
     match _ov_mode:
         "pause":
             if i == 0:
                 _close_overlay()
             elif i == 1:
                 _restart_round()
+            elif i == 2:
+                _muted = not _muted
+                _ov_buttons[2].text = _sound_label()
+                _save_game()
+            elif i == 3:
+                _go_menu()
         "confirm":
             if i == 0:
                 _do_buy(true)
@@ -548,19 +690,34 @@ func _on_ov_button(i: int) -> void:
             elif i == 4:
                 _start_next_round()
         "win":
-            get_tree().reload_current_scene()
+            if i == 0:
+                get_tree().reload_current_scene()
+            else:
+                _go_menu()
         "lose":
             if i == 0:
                 _restart_round()
-            else:
+            elif i == 1:
                 get_tree().reload_current_scene()
+            else:
+                _go_menu()
 
 
 func _on_pause_pressed() -> void:
     if _game_state != STATE_PLAYING or _paused:
         return
+    _sfx("click")
     _paused = true
-    _show_overlay("pause", "PAUSED", "The game clock is stopped.", ["Resume", "Restart round"])
+    var labels: Array[String] = ["Resume", "Restart round", _sound_label(), "Main menu"]
+    _show_overlay("pause", "PAUSED", "The game clock is stopped.", labels)
+
+
+func _on_crop_pressed() -> void:
+    if _paused or _game_state != STATE_PLAYING:
+        return
+    _sel_crop = CROP_CORN if _sel_crop == CROP_TOMATO else CROP_TOMATO
+    _crop_btn.text = "Plant: Tomato" if _sel_crop == CROP_TOMATO else "Plant: Corn"
+    _sfx("click")
 
 
 func _show_shop() -> void:
@@ -585,9 +742,10 @@ func _show_shop() -> void:
 func _open_buy_confirm() -> void:
     var cost := _price(true)
     _paused = true
+    var labels: Array[String] = ["Buy for $%d" % cost, "Cancel"]
     _show_overlay("confirm", "Buy soil block?",
         "Cost: $%d (includes %d%% rush fee)\nYou have: $%d" % [cost, roundi(RUSH_FEE * 100.0), _money],
-        ["Buy for $%d" % cost, "Cancel"])
+        labels)
     _ov_buttons[0].disabled = _money < cost
 
 
@@ -605,6 +763,7 @@ func _do_buy(rush: bool) -> void:
 
     _money -= cost
     _owned_extra += 1
+    _sfx("buy")
     var p := Plot.new()
     p.cell = cell
     _plots.append(p)
@@ -624,19 +783,28 @@ func _do_buy(rush: bool) -> void:
 
 
 func _update_hud() -> void:
-    _inv_label.text = "Tomatoes: %d     Eggs: %d\nMoney: $%d" % [_tomatoes, _eggs, _money]
+    var inv := "Tomatoes: %d" % _tomatoes
+    if _corn_unlocked():
+        inv += "     Corn: %d" % _corn
+    inv += "     Eggs: %d\nMoney: $%d" % [_eggs, _money]
+    _inv_label.text = inv
+
     if _in_grace:
         _timer_label.text = "GRACE  %d" % ceili(_time_left)
     else:
         _timer_label.text = "%d" % ceili(_time_left)
 
     var w := mini(_wave, _wave_count() - 1)
-    var txt := "Round %d of %d - Order %d of %d\nTomatoes %d/%d    Eggs %d/%d    Reward $%d" % [
-        _round + 1, ROUND_TOMATOES.size(), w + 1, _wave_count(),
-        _del_tomatoes, _need_t(w),
-        _del_eggs, _need_e(w),
-        _reward(w)]
-    if _del_tomatoes == 0 and _del_eggs == 0:
+    var line := ""
+    if _need_t(w) > 0:
+        line += "Tomatoes %d/%d" % [_del_t, _need_t(w)]
+    if _need_c(w) > 0:
+        line += ("    " if line != "" else "") + "Corn %d/%d" % [_del_c, _need_c(w)]
+    if _need_e(w) > 0:
+        line += ("    " if line != "" else "") + "Eggs %d/%d" % [_del_e, _need_e(w)]
+    var txt := "Round %d of %d - Order %d of %d\n%s    Reward $%d" % [
+        _round + 1, ROUND_COUNT, w + 1, _wave_count(), line, _reward(w)]
+    if _del_t == 0 and _del_c == 0 and _del_e == 0:
         txt += "\nDeliver it all in one trip for a queue boost!"
     _order_label.text = txt
 
@@ -646,16 +814,22 @@ func _update_hud() -> void:
     else:
         _boost_label.visible = false
 
+    _crop_btn.visible = _corn_unlocked() and _game_state == STATE_PLAYING and not _paused
 
-func _toast(text: String) -> void:
+
+func _toast(text: String, secs: float = 2.5) -> void:
     _toast_label.text = text
     _toast_label.modulate.a = 1.0
-    _toast_left = 2.5
+    _toast_left = secs
 
 
 func _flash(cell: Vector2i) -> void:
     _flash_cell = cell
     _flash_left = 0.6
+
+
+func _pop(text: String, world_pos: Vector2, color: Color) -> void:
+    _pops.append({"t": text, "p": world_pos, "a": 0.0, "c": color})
 
 
 # ---------------- Job queue UI ----------------
@@ -751,11 +925,16 @@ func _on_remove_queued(i: int) -> void:
 # ---------------- Game loop ----------------
 
 func _process(delta: float) -> void:
+    _anim += delta
     if _flash_left > 0.0:
         _flash_left -= delta
     if _toast_left > 0.0:
         _toast_left -= delta
         _toast_label.modulate.a = clampf(_toast_left / 0.5, 0.0, 1.0)
+    for i in range(_pops.size() - 1, -1, -1):
+        _pops[i]["a"] = float(_pops[i]["a"]) + delta
+        if float(_pops[i]["a"]) > 1.2:
+            _pops.remove_at(i)
     if not _paused and _game_state == STATE_PLAYING:
         _tick_world(delta)
     _update_hud()
@@ -769,12 +948,19 @@ func _tick_world(delta: float) -> void:
         if not _in_grace:
             _in_grace = true
             _time_left = GRACE_TIME
+            _last_tick_sec = -1
             _timer_label.add_theme_color_override("font_color", Color(1.0, 0.3, 0.3))
             _toast("Time's up! Grace period - finish your orders!")
         else:
             _time_left = 0.0
             _game_over()
             return
+
+    var sec := ceili(_time_left)
+    if sec != _last_tick_sec:
+        _last_tick_sec = sec
+        if _in_grace or sec <= 10:
+            _sfx("tick")
 
     if _boost_left > 0.0:
         _boost_left -= delta
@@ -806,9 +992,11 @@ func _tick_world(delta: float) -> void:
 
 func _game_over() -> void:
     _game_state = STATE_LOST
+    _sfx("lose")
+    var labels: Array[String] = ["Retry round", "New game", "Main menu"]
     _show_overlay("lose", "TIME'S UP",
         "Round %d - orders completed: %d of %d" % [_round + 1, _wave, _wave_count()],
-        ["Retry round", "New game"])
+        labels)
 
 
 func _move_farmer(delta: float) -> void:
@@ -829,6 +1017,10 @@ func _is_busy() -> bool:
     return _order != null or _act_kind != ""
 
 
+func _is_walking() -> bool:
+    return not _path.is_empty() and _act_kind == "" and not _paused and _game_state == STATE_PLAYING
+
+
 func _arrive() -> void:
     var o := _order
     _order = null
@@ -843,20 +1035,23 @@ func _arrive() -> void:
                 _start_action("collect", COLLECT_TIME, null)
             else:
                 _toast("No eggs yet")
+                _sfx("error")
                 _after_action()
         "delivery":
             var give := _deliverable()
-            if give.x + give.y > 0:
+            if give.x + give.y + give.z > 0:
                 _start_action("deliver", DELIVER_TIME, null)
             else:
                 _toast("Nothing in your basket for this order")
+                _sfx("error")
                 _after_action()
 
 
-func _deliverable() -> Vector2i:
-    return Vector2i(
-        mini(_tomatoes, _need_t(_wave) - _del_tomatoes),
-        mini(_eggs, _need_e(_wave) - _del_eggs))
+func _deliverable() -> Vector3i:
+    return Vector3i(
+        mini(_tomatoes, _need_t(_wave) - _del_t),
+        mini(_corn, _need_c(_wave) - _del_c),
+        mini(_eggs, _need_e(_wave) - _del_e))
 
 
 func _begin_plot_action(p: Plot) -> void:
@@ -866,6 +1061,7 @@ func _begin_plot_action(p: Plot) -> void:
         _start_action("harvest", HARVEST_TIME, p)
     else:
         _toast("Still growing...")
+        _sfx("error")
         _after_action()
 
 
@@ -893,41 +1089,59 @@ func _finish_action() -> void:
     match kind:
         "plant":
             p.state = PLOT_GROWING
-            p.grow_left = _grow_time()
+            p.crop = _sel_crop
+            p.grow_left = _grow_time(p.crop)
+            _sfx("plant")
         "harvest":
             p.state = PLOT_EMPTY
-            _tomatoes += 1
-            _toast("+1 Tomato")
+            if p.crop == CROP_CORN:
+                _corn += 1
+                _pop("+1 Corn", grid_to_world(p.cell) + Vector2(0, -50), Color(1.0, 0.9, 0.3))
+                _toast("+1 Corn")
+            else:
+                _tomatoes += 1
+                _pop("+1 Tomato", grid_to_world(p.cell) + Vector2(0, -50), Color(1.0, 0.45, 0.4))
+                _toast("+1 Tomato")
+            _sfx("harvest")
         "collect":
             _eggs += _eggs_ready
+            _pop("+%d Eggs" % _eggs_ready, grid_to_world(COOP_CELL) + Vector2(0, -100), Color(1.0, 1.0, 0.9))
             _toast("+%d Eggs" % _eggs_ready)
             _eggs_ready = 0
+            _sfx("collect")
         "deliver":
             var give := _deliverable()
-            var fresh := _del_tomatoes == 0 and _del_eggs == 0
+            var fresh := _del_t == 0 and _del_c == 0 and _del_e == 0
             _tomatoes -= give.x
-            _eggs -= give.y
-            _del_tomatoes += give.x
-            _del_eggs += give.y
-            if _del_tomatoes >= _need_t(_wave) and _del_eggs >= _need_e(_wave):
+            _corn -= give.y
+            _eggs -= give.z
+            _del_t += give.x
+            _del_c += give.y
+            _del_e += give.z
+            if _del_t >= _need_t(_wave) and _del_c >= _need_c(_wave) and _del_e >= _need_e(_wave):
                 _complete_wave(fresh)
             else:
-                _toast("Delivered %d tomatoes, %d eggs" % [give.x, give.y])
+                _sfx("deliver")
+                _toast("Delivered %d tomatoes, %d corn, %d eggs" % [give.x, give.y, give.z])
     _after_action()
 
 
 func _complete_wave(perfect: bool) -> void:
     var reward := _reward(_wave)
     _money += reward
+    _pop("+$%d" % reward, grid_to_world(DELIVERY_CELL) + Vector2(0, -70), Color(1.0, 0.85, 0.2))
     _wave += 1
-    _del_tomatoes = 0
-    _del_eggs = 0
+    _del_t = 0
+    _del_c = 0
+    _del_e = 0
     if _wave >= _wave_count():
         _end_round()
     elif perfect:
         _boost_left = POWERUP_TIME
+        _sfx("coin")
         _toast("Perfect delivery! +$%d - queue boosted to %d jobs for %d s" % [reward, QUEUE_MAX_BOOSTED, int(POWERUP_TIME)])
     else:
+        _sfx("coin")
         _toast("Order complete! +$%d - next customer is here" % reward)
 
 
@@ -986,6 +1200,7 @@ func _start_order(order: Order) -> bool:
     if path.is_empty():
         _flash(order.cell)
         _toast("Can't reach that spot")
+        _sfx("error")
         return false
     _order = order
     _path = path
@@ -1018,11 +1233,13 @@ func _handle_tap(screen_pos: Vector2) -> void:
     if order == null:
         _flash(cell)
         _toast("Blocked")
+        _sfx("error")
         return
 
     if _is_busy():
         if _queue.size() >= _queue_max():
             _toast("Queue full (%d jobs)" % _queue_max())
+            _sfx("error")
             return
         _queue.append(order)
     else:
@@ -1084,12 +1301,50 @@ func _draw() -> void:
             draw_colored_polygon(pts, COLOR_A if (x + y) % 2 == 0 else COLOR_B)
             pts.append(pts[0])
             draw_polyline(pts, COLOR_EDGE, 1.5)
+            _draw_decor(x, y, c)
+
+    var fence := PackedVector2Array([
+        grid_to_world(Vector2i(0, 0)) + Vector2(0, -TILE_H * 0.5),
+        grid_to_world(Vector2i(GRID_W - 1, 0)) + Vector2(TILE_W * 0.5, 0),
+        grid_to_world(Vector2i(GRID_W - 1, GRID_H - 1)) + Vector2(0, TILE_H * 0.5),
+        grid_to_world(Vector2i(0, GRID_H - 1)) + Vector2(-TILE_W * 0.5, 0),
+    ])
+    fence.append(fence[0])
+    draw_polyline(fence, COLOR_FENCE, 8.0)
+
+
+func _draw_decor(x: int, y: int, c: Vector2) -> void:
+    var cell := Vector2i(x, y)
+    if TREE_CELLS.has(cell) or PLOT_CELLS.has(cell) or NEW_PLOT_CELLS.has(cell):
+        return
+    if cell == COOP_CELL or cell == DELIVERY_CELL or cell == START_CELL:
+        return
+    var h: int = absi((x * 73 + y * 151 + x * y * 31) % 13)
+    if h == 0:
+        for k in 3:
+            var off := Vector2(-14.0 + k * 14.0, -3.0 + (k % 2) * 7.0)
+            var col := Color(1.0, 0.9, 0.3) if k != 1 else Color(1.0, 0.5, 0.7)
+            draw_circle(c + off, 3.5, col)
+    elif h == 1:
+        for k in 3:
+            var bx := c.x - 10.0 + k * 10.0
+            draw_line(Vector2(bx, c.y + 5.0), Vector2(bx + (k - 1) * 3.0, c.y - 6.0), COLOR_EDGE, 2.0)
 
 
 func _diamond_outline(cell: Vector2i, color: Color) -> void:
     var pts := _diamond_points(grid_to_world(cell), 0.9)
     pts.append(pts[0])
     _entities.draw_polyline(pts, color, 4.0)
+
+
+func _hen_phase(i: int) -> float:
+    return _anim * (0.6 + 0.13 * i) + i * 2.1
+
+
+func _hen_pos(i: int) -> Vector2:
+    var base := grid_to_world(COOP_CELL + Vector2i(-1, 1))
+    var a := _hen_phase(i)
+    return base + Vector2(sin(a) * (50.0 + 8.0 * i), cos(a * 1.3) * 22.0 + i * 6.0)
 
 
 func _draw_entities() -> void:
@@ -1110,6 +1365,8 @@ func _draw_entities() -> void:
         items.append({"y": grid_to_world(p.cell).y, "fn": _draw_plot.bind(p)})
     items.append({"y": grid_to_world(COOP_CELL).y, "fn": _draw_coop})
     items.append({"y": grid_to_world(DELIVERY_CELL).y, "fn": _draw_delivery})
+    for i in 2 + _lv[0]:
+        items.append({"y": _hen_pos(i).y, "fn": _draw_hen.bind(i)})
     items.append({"y": _pos.y, "fn": _draw_farmer})
     items.sort_custom(func(a, b): return a["y"] < b["y"])
     for item in items:
@@ -1119,6 +1376,17 @@ func _draw_entities() -> void:
         var qc := grid_to_world(_queue[i].cell)
         _entities.draw_string(ThemeDB.fallback_font, qc + Vector2(-20, 10), str(i + 1),
             HORIZONTAL_ALIGNMENT_CENTER, 40.0, 30, Color.WHITE)
+
+    for pop in _pops:
+        var age: float = pop["a"]
+        var col: Color = pop["c"]
+        var at: Vector2 = pop["p"]
+        col.a = clampf(1.0 - age / 1.2, 0.0, 1.0)
+        at += Vector2(-100.0, -age * 40.0)
+        _entities.draw_string(ThemeDB.fallback_font, at + Vector2(2, 2), pop["t"],
+            HORIZONTAL_ALIGNMENT_CENTER, 200.0, 26, Color(0, 0, 0, col.a))
+        _entities.draw_string(ThemeDB.fallback_font, at, pop["t"],
+            HORIZONTAL_ALIGNMENT_CENTER, 200.0, 26, col)
 
 
 func _draw_forsale() -> void:
@@ -1142,16 +1410,23 @@ func _draw_plot(p: Plot) -> void:
     var c := grid_to_world(p.cell)
     _entities.draw_colored_polygon(_diamond_points(c, 0.92), Color(0.45, 0.30, 0.17))
     if p.state == PLOT_GROWING:
-        var t := 1.0 - p.grow_left / _grow_time()
+        var t := 1.0 - p.grow_left / _grow_time(p.crop)
         var h := lerpf(6.0, 26.0, t)
         _entities.draw_line(c + Vector2(0, 4), c + Vector2(0, 4.0 - h), Color(0.2, 0.65, 0.2), 4.0)
         _entities.draw_circle(c + Vector2(-8, 2.0 - h * 0.6), 5.0 + 3.0 * t, Color(0.25, 0.70, 0.25))
         _entities.draw_circle(c + Vector2(8, 2.0 - h * 0.8), 5.0 + 3.0 * t, Color(0.25, 0.70, 0.25))
     elif p.state == PLOT_READY:
-        _entities.draw_line(c + Vector2(0, 4), c + Vector2(0, -26), Color(0.2, 0.6, 0.2), 4.0)
-        _entities.draw_circle(c + Vector2(-11, -12), 9.0, Color(0.85, 0.12, 0.10))
-        _entities.draw_circle(c + Vector2(11, -10), 9.0, Color(0.85, 0.12, 0.10))
-        _entities.draw_circle(c + Vector2(0, -26), 9.0, Color(0.90, 0.16, 0.12))
+        if p.crop == CROP_CORN:
+            _entities.draw_line(c + Vector2(0, 4), c + Vector2(0, -36), Color(0.25, 0.6, 0.2), 5.0)
+            _entities.draw_line(c + Vector2(0, -10), c + Vector2(-14, -22), Color(0.3, 0.7, 0.25), 4.0)
+            _entities.draw_line(c + Vector2(0, -16), c + Vector2(14, -28), Color(0.3, 0.7, 0.25), 4.0)
+            _entities.draw_rect(Rect2(c.x - 6.0, c.y - 34.0, 12.0, 22.0), Color(0.98, 0.85, 0.2))
+            _entities.draw_rect(Rect2(c.x - 6.0, c.y - 34.0, 12.0, 22.0), Color(0.75, 0.6, 0.1), false, 2.0)
+        else:
+            _entities.draw_line(c + Vector2(0, 4), c + Vector2(0, -26), Color(0.2, 0.6, 0.2), 4.0)
+            _entities.draw_circle(c + Vector2(-11, -12), 9.0, Color(0.85, 0.12, 0.10))
+            _entities.draw_circle(c + Vector2(11, -10), 9.0, Color(0.85, 0.12, 0.10))
+            _entities.draw_circle(c + Vector2(0, -26), 9.0, Color(0.90, 0.16, 0.12))
 
 
 func _draw_coop() -> void:
@@ -1165,6 +1440,18 @@ func _draw_coop() -> void:
         _entities.draw_circle(c + Vector2(-30.0 + i * 20.0, 12), 8.0, Color(0.98, 0.96, 0.88))
 
 
+func _draw_hen(i: int) -> void:
+    var c := _hen_pos(i)
+    var dir := 1.0 if cos(_hen_phase(i)) >= 0.0 else -1.0
+    _entities.draw_circle(c + Vector2(0, 2), 9.0, Color(0, 0, 0, 0.2))
+    _entities.draw_circle(c + Vector2(0, -10), 10.0, Color(0.97, 0.95, 0.90))
+    _entities.draw_circle(c + Vector2(dir * 9.0, -18.0), 5.5, Color(0.97, 0.95, 0.90))
+    _entities.draw_circle(c + Vector2(dir * 9.0, -24.0), 2.5, Color(0.85, 0.15, 0.10))
+    _entities.draw_colored_polygon(
+        PackedVector2Array([c + Vector2(dir * 13.0, -19.0), c + Vector2(dir * 19.0, -17.0), c + Vector2(dir * 13.0, -15.0)]),
+        Color(0.95, 0.70, 0.20))
+
+
 func _draw_delivery() -> void:
     var c := grid_to_world(DELIVERY_CELL)
     _entities.draw_rect(Rect2(c.x - 30.0, c.y - 36.0, 60.0, 36.0), Color(0.78, 0.62, 0.35))
@@ -1174,8 +1461,13 @@ func _draw_delivery() -> void:
 
 
 func _draw_farmer() -> void:
-    var c := _pos
-    _entities.draw_circle(c + Vector2(0, 2), 14.0, Color(0, 0, 0, 0.25))
+    var bob := 0.0
+    if _act_kind != "":
+        bob = absf(sin(_anim * 10.0)) * 3.0
+    elif _is_walking():
+        bob = absf(sin(_anim * 14.0)) * 5.0
+    var c := _pos + Vector2(0, -bob)
+    _entities.draw_circle(_pos + Vector2(0, 2), 14.0, Color(0, 0, 0, 0.25))
     _entities.draw_rect(Rect2(c.x - 10.0, c.y - 34.0, 20.0, 30.0), Color(0.20, 0.35, 0.75))
     _entities.draw_circle(c + Vector2(0, -44), 10.0, Color(0.95, 0.78, 0.62))
     _entities.draw_rect(Rect2(c.x - 16.0, c.y - 52.0, 32.0, 5.0), Color(0.95, 0.80, 0.25))
