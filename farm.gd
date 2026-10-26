@@ -1,19 +1,28 @@
 extends Node2D
 
-const BUILD_NUMBER := 9
+const BUILD_NUMBER := 10
 
 # ---- Tunable gameplay values (seconds) ----
 const PLANT_TIME := 1.0
 const HARVEST_TIME := 1.0
 const COLLECT_TIME := 1.0
 const DELIVER_TIME := 1.0
-const CROP_GROW_TIME := 8.0
-const EGG_TIME := 12.0
 const EGG_CAP := 4
 const MAIN_TIME := 90.0
 const GRACE_TIME := 15.0
-const FARMER_SPEED := 280.0
 const DRAG_THRESHOLD := 14.0
+
+# ---- Upgrades: index = level (0 = base) ----
+const UP_NAMES: Array[String] = ["Hens", "Fertilizer", "Boots"]
+const UP_COSTS: Array = [[100, 200], [120, 240], [80, 160]]
+const EGG_TIMES: Array[float] = [12.0, 9.0, 6.0]
+const GROW_TIMES: Array[float] = [8.0, 6.0, 4.0]
+const SPEEDS: Array[float] = [280.0, 350.0, 420.0]
+
+# ---- Stars ----
+const STAR3_TIME_LEFT := 25.0
+const STAR_BONUS := 10
+const SAVE_PATH := "user://sunpatch_save.cfg"
 
 # ---- Job queue size and power-up ----
 const QUEUE_MAX_BASE := 4
@@ -92,8 +101,15 @@ var _money := START_MONEY
 
 var _round := 0
 var _owned_extra := 0
+var _lv: Array[int] = [0, 0, 0]
 var _snap_money := 0
 var _snap_extra := 0
+var _snap_lv: Array[int] = [0, 0, 0]
+
+var _run_stars: Array[int] = [0, 0, 0]
+var _best_stars: Array[int] = [0, 0, 0]
+var _best_money := 0
+var _round_summary := ""
 
 var _wave := 0
 var _del_tomatoes := 0
@@ -144,6 +160,48 @@ func _queue_max() -> int:
     return QUEUE_MAX_BOOSTED if _boost_left > 0.0 else QUEUE_MAX_BASE
 
 
+# ---- Upgrade-driven values ----
+
+func _egg_time() -> float:
+    return EGG_TIMES[_lv[0]]
+
+
+func _grow_time() -> float:
+    return GROW_TIMES[_lv[1]]
+
+
+func _speed() -> float:
+    return SPEEDS[_lv[2]]
+
+
+func _upgrade_cost(u: int) -> int:
+    var lvl: int = _lv[u]
+    if lvl >= 2:
+        return -1
+    return int(UP_COSTS[u][lvl])
+
+
+func _upgrade_label(u: int) -> String:
+    var cost := _upgrade_cost(u)
+    if cost < 0:
+        return "%s: MAX" % UP_NAMES[u]
+    var next_lv: int = _lv[u] + 1
+    if u == 0:
+        return "Hens: egg every %ds - $%d" % [int(EGG_TIMES[next_lv]), cost]
+    if u == 1:
+        return "Fertilizer: crops grow in %ds - $%d" % [int(GROW_TIMES[next_lv]), cost]
+    return "Boots: walk +%d%% - $%d" % [roundi((SPEEDS[next_lv] / SPEEDS[0] - 1.0) * 100.0), cost]
+
+
+func _buy_upgrade(u: int) -> void:
+    var cost := _upgrade_cost(u)
+    if cost < 0 or _money < cost:
+        return
+    _money -= cost
+    _lv[u] += 1
+    _show_shop()
+
+
 # ---- Round data helpers ----
 
 func _wave_count() -> int:
@@ -175,7 +233,39 @@ func _price(rush: bool) -> int:
     return base
 
 
+# ---- Save / stars ----
+
+func _load_game() -> void:
+    var cf := ConfigFile.new()
+    if cf.load(SAVE_PATH) != OK:
+        return
+    for i in 3:
+        _best_stars[i] = int(cf.get_value("best", "round%d" % i, 0))
+    _best_money = int(cf.get_value("best", "money", 0))
+
+
+func _save_game() -> void:
+    var cf := ConfigFile.new()
+    for i in 3:
+        cf.set_value("best", "round%d" % i, _best_stars[i])
+    cf.set_value("best", "money", _best_money)
+    cf.save(SAVE_PATH)
+
+
+func _calc_stars() -> int:
+    if _in_grace:
+        return 1
+    if _time_left >= STAR3_TIME_LEFT:
+        return 3
+    return 2
+
+
+func _stars_text(n: int) -> String:
+    return "[" + "*".repeat(n) + "-".repeat(3 - n) + "]"
+
+
 func _ready() -> void:
+    _load_game()
     _build_map_data()
 
     _entities = Node2D.new()
@@ -244,15 +334,19 @@ func _start_round() -> void:
         p.grow_left = 0.0
     _snap_money = _money
     _snap_extra = _owned_extra
+    for i in 3:
+        _snap_lv[i] = _lv[i]
     _overlay.visible = false
     _pause_btn.visible = true
     _queue_sig = ""
-    _toast("Round %d - Order 1 is in! Grow, collect, deliver." % (_round + 1))
+    _toast("Round %d - finish with %ds+ left for 3 stars!" % [_round + 1, int(STAR3_TIME_LEFT)])
 
 
 func _restart_round() -> void:
     _money = _snap_money
     _owned_extra = _snap_extra
+    for i in 3:
+        _lv[i] = _snap_lv[i]
     _build_map_data()
     _start_round()
 
@@ -265,12 +359,29 @@ func _start_next_round() -> void:
 func _end_round() -> void:
     _queue.clear()
     _cancel_action()
+    var stars := _calc_stars()
+    var bonus := stars * STAR_BONUS
+    _money += bonus
+    _run_stars[_round] = stars
+    if stars > _best_stars[_round]:
+        _best_stars[_round] = stars
+    _round_summary = "Stars: %s  (+$%d bonus)   Best: %s" % [
+        _stars_text(stars), bonus, _stars_text(_best_stars[_round])]
+
     if _round >= ROUND_TOMATOES.size() - 1:
+        if _money > _best_money:
+            _best_money = _money
+        _save_game()
+        var total := 0
+        for s in _run_stars:
+            total += s
         _game_state = STATE_WON
         _show_overlay("win", "YOU WIN!",
-            "All %d rounds complete!\nMoney: $%d" % [ROUND_TOMATOES.size(), _money],
+            "%s\nAll %d rounds complete!\nTotal stars: %d of %d\nMoney: $%d     Best money: $%d" % [
+                _round_summary, ROUND_TOMATOES.size(), total, ROUND_TOMATOES.size() * 3, _money, _best_money],
             ["Play again"])
     else:
+        _save_game()
         _game_state = STATE_SHOP
         _show_shop()
 
@@ -286,10 +397,10 @@ func _make_label(font_size: int) -> Label:
     return l
 
 
-func _make_button(text: String, w: float) -> Button:
+func _make_button(text: String, w: float, h: float = 64.0) -> Button:
     var b := Button.new()
     b.text = text
-    b.custom_minimum_size = Vector2(w, 64)
+    b.custom_minimum_size = Vector2(w, h)
     b.add_theme_font_size_override("font_size", 30)
     return b
 
@@ -366,7 +477,7 @@ func _build_overlay(hud: CanvasLayer) -> void:
     _overlay.visible = false
 
     var dim := ColorRect.new()
-    dim.color = Color(0, 0, 0, 0.72)
+    dim.color = Color(0, 0, 0, 0.78)
     _overlay.add_child(dim)
     dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 
@@ -375,19 +486,20 @@ func _build_overlay(hud: CanvasLayer) -> void:
     center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 
     var box := VBoxContainer.new()
-    box.add_theme_constant_override("separation", 20)
+    box.add_theme_constant_override("separation", 10)
     center.add_child(box)
 
-    _ov_title = _make_label(64)
+    _ov_title = _make_label(52)
     _ov_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
     box.add_child(_ov_title)
 
-    _ov_info = _make_label(30)
+    _ov_info = _make_label(26)
     _ov_info.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
     box.add_child(_ov_info)
 
-    for i in 3:
-        var b := _make_button("", 440.0)
+    for i in 5:
+        var b := _make_button("", 600.0, 54.0)
+        b.add_theme_font_size_override("font_size", 26)
         b.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
         b.pressed.connect(_on_ov_button.bind(i))
         box.add_child(b)
@@ -398,7 +510,7 @@ func _show_overlay(mode: String, title: String, info: String, labels: Array[Stri
     _ov_mode = mode
     _ov_title.text = title
     _ov_info.text = info
-    for i in 3:
+    for i in 5:
         var b := _ov_buttons[i]
         if i < labels.size() and labels[i] != "":
             b.text = labels[i]
@@ -431,7 +543,9 @@ func _on_ov_button(i: int) -> void:
         "shop":
             if i == 0:
                 _do_buy(false)
-            elif i == 1:
+            elif i >= 1 and i <= 3:
+                _buy_upgrade(i - 1)
+            elif i == 4:
                 _start_next_round()
         "win":
             get_tree().reload_current_scene()
@@ -452,15 +566,20 @@ func _on_pause_pressed() -> void:
 func _show_shop() -> void:
     var labels: Array[String] = []
     if _next_slot_exists():
-        labels.append("Buy soil block - $%d" % _price(false))
+        labels.append("Soil block - $%d" % _price(false))
     else:
-        labels.append("All soil blocks bought")
+        labels.append("Soil blocks: all bought")
+    labels.append(_upgrade_label(0))
+    labels.append(_upgrade_label(1))
+    labels.append(_upgrade_label(2))
     labels.append("Start round %d" % (_round + 2))
-    _show_overlay("shop", "ROUND %d COMPLETE" % (_round + 1),
-        "Money: $%d\nSoil blocks bought: %d of %d" % [_money, _owned_extra, NEW_PLOT_CELLS.size()],
-        labels)
-    var can_buy := _next_slot_exists() and _money >= _price(false)
-    _ov_buttons[0].disabled = not can_buy
+    var info := "%s\nMoney: $%d     Soil blocks: %d of %d" % [
+        _round_summary, _money, _owned_extra, NEW_PLOT_CELLS.size()]
+    _show_overlay("shop", "ROUND %d COMPLETE" % (_round + 1), info, labels)
+    _ov_buttons[0].disabled = not (_next_slot_exists() and _money >= _price(false))
+    for u in 3:
+        var cost := _upgrade_cost(u)
+        _ov_buttons[u + 1].disabled = cost < 0 or _money < cost
 
 
 func _open_buy_confirm() -> void:
@@ -672,7 +791,7 @@ func _tick_world(delta: float) -> void:
 
     if _eggs_ready < EGG_CAP:
         _egg_timer += delta
-        if _egg_timer >= EGG_TIME:
+        if _egg_timer >= _egg_time():
             _egg_timer = 0.0
             _eggs_ready += 1
 
@@ -696,7 +815,7 @@ func _move_farmer(delta: float) -> void:
     if _path.is_empty():
         return
     var target := grid_to_world(_path[0])
-    var step := FARMER_SPEED * delta
+    var step := _speed() * delta
     if _pos.distance_to(target) <= step:
         _pos = target
         _path.remove_at(0)
@@ -774,7 +893,7 @@ func _finish_action() -> void:
     match kind:
         "plant":
             p.state = PLOT_GROWING
-            p.grow_left = CROP_GROW_TIME
+            p.grow_left = _grow_time()
         "harvest":
             p.state = PLOT_EMPTY
             _tomatoes += 1
@@ -1023,7 +1142,7 @@ func _draw_plot(p: Plot) -> void:
     var c := grid_to_world(p.cell)
     _entities.draw_colored_polygon(_diamond_points(c, 0.92), Color(0.45, 0.30, 0.17))
     if p.state == PLOT_GROWING:
-        var t := 1.0 - p.grow_left / CROP_GROW_TIME
+        var t := 1.0 - p.grow_left / _grow_time()
         var h := lerpf(6.0, 26.0, t)
         _entities.draw_line(c + Vector2(0, 4), c + Vector2(0, 4.0 - h), Color(0.2, 0.65, 0.2), 4.0)
         _entities.draw_circle(c + Vector2(-8, 2.0 - h * 0.6), 5.0 + 3.0 * t, Color(0.25, 0.70, 0.25))
